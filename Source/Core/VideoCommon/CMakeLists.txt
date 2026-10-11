@@ -50,6 +50,8 @@ add_library(videocommon
   CommandProcessor.h
   ConstantManager.h
   Constants.h
+  CouchOverlay.cpp
+  CouchOverlay.h
   CPMemory.cpp
   CPMemory.h
   CPUCull.cpp

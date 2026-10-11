@@ -26,6 +26,8 @@ signals:
   void ChangeDisc();
 
   void ExitHotkey();
+  void CouchExit();
+  void CouchDialogNav(unsigned nav);
   void UnlockCursor();
   void ActivateChat();
   void RequestGolfControl();
@@ -72,6 +74,7 @@ signals:
   void InfinityBaseHotkey();
 
 private:
+  void DispatchCouchOverlayActions();
   void Run();
   void CheckDebuggingHotkeys();
   void CheckGBAHotkeys();

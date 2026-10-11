@@ -527,6 +527,7 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
     bool operator()(BootParameters::Disc& disc) const
     {
       NOTICE_LOG_FMT(BOOT, "Booting from disc: {}", disc.path);
+      system.GetDVDInterface().SetCurrentDiscPath(disc.path);
       const DiscIO::VolumeDisc* volume =
           SetDisc(system.GetDVDInterface(), std::move(disc.volume), disc.auto_disc_change_paths);
       AchievementManager::GetInstance().LoadGame(volume);

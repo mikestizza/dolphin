@@ -409,4 +409,14 @@ void CPUManager::AddCPUThreadJob(Common::MoveOnlyFunction<void()> function)
   m_pending_jobs.push(std::move(function));
 }
 
+bool CPUManager::QueueJobIfPaused(Common::MoveOnlyFunction<void()> function)
+{
+  std::unique_lock state_lock(m_state_change_lock);
+  if (m_state != State::Stepping || m_state_paused_and_locked)
+    return false;
+  m_pending_jobs.push(std::move(function));
+  m_state_cpu_cvar.notify_one();
+  return true;
+}
+
 }  // namespace CPU

@@ -39,6 +39,7 @@
 #include "InputCommon/ControlReference/ControlReference.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 
+#include "VideoCommon/CouchOverlay.h"
 #include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -140,6 +141,38 @@ static void HandleFrameStepHotkeys()
   }
 }
 
+void HotkeyScheduler::DispatchCouchOverlayActions()
+{
+  CouchOverlay::PendingHostAction a;
+  while (CouchOverlay::TakeHostAction(&a))
+  {
+    switch (a.action)
+    {
+    case CouchOverlay::HostAction::Exit:
+      emit CouchExit();
+      break;
+    case CouchOverlay::HostAction::Reset:
+      emit ResetHotkey();
+      break;
+    case CouchOverlay::HostAction::Screenshot:
+      emit ScreenShotHotkey();
+      break;
+    case CouchOverlay::HostAction::FullScreen:
+      emit FullScreenHotkey();
+      break;
+    case CouchOverlay::HostAction::StateSave:
+      emit StateSaveSlot(a.arg);
+      break;
+    case CouchOverlay::HostAction::StateLoad:
+      emit StateLoadSlot(a.arg);
+      break;
+    case CouchOverlay::HostAction::StateUndoLoad:
+      emit StateLoadUndo();
+      break;
+    }
+  }
+}
+
 void HotkeyScheduler::Run()
 {
   Common::SetCurrentThreadName("HotkeyScheduler");
@@ -158,6 +191,11 @@ void HotkeyScheduler::Run()
     if (!HotkeyManagerEmu::IsEnabled())
       continue;
 
+    // Couch overlay: let the pad answer desktop dialogs. Hotkeys are disabled while controller
+    // mapping windows are open, so this never interferes with binding buttons.
+    if (const unsigned dialog_nav = CouchOverlay::PollDialogNav(); dialog_nav != 0)
+      emit CouchDialogNav(dialog_nav);
+
     Core::System& system = Core::System::GetInstance();
     if (Core::GetState(system) != Core::State::Stopping)
     {
@@ -170,6 +208,15 @@ void HotkeyScheduler::Run()
       ControlReference::SetInputGate(true);
 
       HotkeyManagerEmu::GetStatus(true);
+
+      // Couch overlay. While it is open it owns the controller, so the remaining hotkeys are
+      // skipped to keep its button presses from firing them too.
+      if (IsHotkey(HK_TOGGLE_COUCH_MENU))
+        CouchOverlay::Toggle(system);
+      DispatchCouchOverlayActions();
+      CouchOverlay::PollHost(system);
+      if (CouchOverlay::IsOpen())
+        continue;
 
       // Open
       if (IsHotkey(HK_OPEN))

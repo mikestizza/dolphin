@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Common/BitField.h"
@@ -146,6 +147,15 @@ public:
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::vector<std::string>& paths);
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::string& new_path);
   bool AutoChangeDisc(const Core::CPUThreadGuard& guard);
+
+  // Couch overlay: path of the disc image currently in the drive (or about to be inserted), and
+  // the multi-disc set it was booted with, if any. Used to offer "Change Disc" without a dialog.
+  void SetCurrentDiscPath(std::string path) { m_current_disc_path = std::move(path); }
+  const std::string& GetCurrentDiscPath() const { return m_current_disc_path; }
+  const std::vector<std::string>& GetAutoDiscChangePaths() const
+  {
+    return m_auto_disc_change_paths;
+  }
 
   // This function returns true and calls SConfig::SetRunningGameMetadata(Volume&, Partition&)
   // if both of the following conditions are true:
@@ -293,6 +303,7 @@ private:
 
   // Disc changing
   std::string m_disc_path_to_insert;
+  std::string m_current_disc_path;
   std::vector<std::string> m_auto_disc_change_paths;
   size_t m_auto_disc_change_index = 0;
 

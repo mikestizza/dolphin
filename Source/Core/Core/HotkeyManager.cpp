@@ -31,6 +31,7 @@ constexpr std::array<const char*, NUM_HOTKEYS> s_hotkey_labels{{
     _trans("Toggle Fullscreen"),
     _trans("Take Screenshot"),
     _trans("Exit"),
+    _trans("Toggle Couch Menu"),
     _trans("Unlock Cursor"),
     _trans("Center Mouse"),
     _trans("Activate NetPlay Chat"),
@@ -269,6 +270,8 @@ void Initialize()
 void LoadConfig()
 {
   s_config.LoadConfig();
+  static_cast<HotkeyManager*>(s_config.GetController(0))
+      ->EnsureCouchMenuBinding(g_controller_interface);
 }
 
 ControllerEmu::ControlGroup* GetHotkeyGroup(HotkeyGroup group)
@@ -392,6 +395,28 @@ int HotkeyManager::GetIndexForGroup(int group, int id) const
   return id - s_groups_info[group].first;
 }
 
+// Couch overlay: guide button on the first XInput pad, with Ctrl+M as a keyboard fallback.
+static std::string GetDefaultCouchMenuExpression()
+{
+#ifdef _WIN32
+  return "`XInput/0/Gamepad:Guide` | @(Ctrl+M)";
+#else
+  return "@(Ctrl+M)";
+#endif
+}
+
+void HotkeyManager::EnsureCouchMenuBinding(const ControllerInterface& ciface)
+{
+  // Hotkeys.ini files written before this hotkey existed have no entry for it, which would leave
+  // the couch menu unreachable from a controller. Give it the default binding in that case.
+  const int group = FindGroupByID(HK_TOGGLE_COUCH_MENU);
+  auto& ref = m_keys[group]->controls[GetIndexForGroup(group, HK_TOGGLE_COUCH_MENU)]->control_ref;
+  if (!ref->GetExpression().empty())
+    return;
+  ref->SetExpression(GetDefaultCouchMenuExpression());
+  UpdateReferences(ciface);
+}
+
 void HotkeyManager::LoadDefaults(const ControllerInterface& ciface)
 {
   EmulatedController::LoadDefaults(ciface);
@@ -419,6 +444,7 @@ void HotkeyManager::LoadDefaults(const ControllerInterface& ciface)
 #ifdef USE_RETRO_ACHIEVEMENTS
   set_key_expression(HK_OPEN_ACHIEVEMENTS, hotkey_string({"Alt", "A"}));
 #endif  // USE_RETRO_ACHIEVEMENTS
+  set_key_expression(HK_TOGGLE_COUCH_MENU, GetDefaultCouchMenuExpression());
   set_key_expression(HK_STEP, "F11");
   set_key_expression(HK_STEP_OVER, hotkey_string({"Shift", "F10"}));
   set_key_expression(HK_STEP_OUT, hotkey_string({"Shift", "F11"}));

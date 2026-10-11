@@ -103,6 +103,12 @@ public:
   // PauseAndLock(), as while the CPU is in the run loop, it won't execute the function.
   void AddCPUThreadJob(Common::MoveOnlyFunction<void()> function);
 
+  // Couch overlay: queues a job and wakes the CPU thread if it is idling in the paused (stepping)
+  // wait. Unlike Core::RunOnCPUThread this neither pauses emulation nor waits for the job, so it
+  // is cheap enough to call every frame. Returns false (and drops the job) unless the CPU is
+  // currently paused, since a running CPU only drains jobs when its state changes.
+  bool QueueJobIfPaused(Common::MoveOnlyFunction<void()> function);
+
 private:
   void FlushStepSyncEventLocked();
   void ExecutePendingJobs(std::unique_lock<std::mutex>& state_lock);

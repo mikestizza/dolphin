@@ -108,6 +108,8 @@ private:
 
   // May ask for confirmation. Returns whether or not it actually stopped.
   bool RequestStop();
+  void RequestStopFromCouchOverlay();
+  void OnCouchDialogNav(unsigned nav);
   void ForceStop();
   void Reset();
   void FrameAdvance();
@@ -246,6 +248,7 @@ private:
   RenderWidget* m_render_widget = nullptr;
   bool m_rendering_to_main;
   bool m_stop_confirm_showing = false;
+  bool m_skip_stop_confirm = false;
   bool m_stop_requested = false;
   bool m_exit_requested = false;
   bool m_fullscreen_requested = false;

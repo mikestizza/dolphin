@@ -499,6 +499,7 @@ void DVDInterface::ChangeDisc(const Core::CPUThreadGuard& guard, const std::stri
   EjectDisc(guard, EjectCause::User);
 
   m_disc_path_to_insert = new_path;
+  m_current_disc_path = new_path;
   m_system.GetCoreTiming().ScheduleEvent(m_system.GetSystemTimers().GetTicksPerSecond(),
                                          m_insert_disc);
   m_system.GetMovie().SignalDiscChange(new_path);

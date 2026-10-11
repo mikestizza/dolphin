@@ -27,6 +27,7 @@ enum Hotkey
   HK_FULLSCREEN,
   HK_SCREENSHOT,
   HK_EXIT,
+  HK_TOGGLE_COUCH_MENU,
   HK_UNLOCK_CURSOR,
   HK_CENTER_MOUSE,
   HK_ACTIVATE_CHAT,
@@ -242,6 +243,7 @@ public:
   int FindGroupByID(int id) const;
   int GetIndexForGroup(int group, int id) const;
   void LoadDefaults(const ControllerInterface& ciface) override;
+  void EnsureCouchMenuBinding(const ControllerInterface& ciface);
 
 private:
   std::array<ControllerEmu::Buttons*, NUM_HOTKEY_GROUPS> m_keys{};

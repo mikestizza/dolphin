@@ -106,6 +106,7 @@
 #include "DolphinQt/NetPlay/NetPlayBrowser.h"
 #include "DolphinQt/NetPlay/NetPlayDialog.h"
 #include "DolphinQt/NetPlay/NetPlaySetupDialog.h"
+#include "DolphinQt/QtUtils/CouchDialogNav.h"
 #include "DolphinQt/QtUtils/DolphinFileDialog.h"
 #include "DolphinQt/QtUtils/FileOpenEventFilter.h"
 #include "DolphinQt/QtUtils/ModalMessageBox.h"
@@ -133,6 +134,7 @@
 
 #include "UICommon/UICommon.h"
 
+#include "VideoCommon/CouchOverlay.h"
 #include "VideoCommon/NetPlayChatUI.h"
 
 #ifdef HAVE_XRANDR
@@ -612,6 +614,10 @@ void MainWindow::ConnectHotkeys()
   connect(m_hotkey_scheduler, &HotkeyScheduler::ChangeDisc, this, &MainWindow::ChangeDisc);
   connect(m_hotkey_scheduler, &HotkeyScheduler::EjectDisc, this, &MainWindow::EjectDisc);
   connect(m_hotkey_scheduler, &HotkeyScheduler::ExitHotkey, this, &MainWindow::close);
+  connect(m_hotkey_scheduler, &HotkeyScheduler::CouchExit, this,
+          &MainWindow::RequestStopFromCouchOverlay);
+  connect(m_hotkey_scheduler, &HotkeyScheduler::CouchDialogNav, this,
+          &MainWindow::OnCouchDialogNav);
   connect(m_hotkey_scheduler, &HotkeyScheduler::UnlockCursor, this, &MainWindow::UnlockCursor);
   connect(m_hotkey_scheduler, &HotkeyScheduler::TogglePauseHotkey, this, &MainWindow::TogglePause);
   connect(m_hotkey_scheduler, &HotkeyScheduler::ActivateChat, this, &MainWindow::OnActivateChat);
@@ -951,6 +957,19 @@ void MainWindow::OnStopComplete()
   }
 }
 
+void MainWindow::OnCouchDialogNav(unsigned nav)
+{
+  if (!CouchOverlay::IsOpen())
+    QtUtils::DriveModalDialogWithController(nav);
+}
+
+void MainWindow::RequestStopFromCouchOverlay()
+{
+  m_skip_stop_confirm = true;
+  RequestStop();
+  m_skip_stop_confirm = false;
+}
+
 bool MainWindow::RequestStop()
 {
   if (Core::IsUninitialized(m_system))
@@ -972,7 +991,9 @@ bool MainWindow::RequestStop()
   else
     FullScreen();
 
-  bool confirm_on_stop = Config::Get(Config::MAIN_CONFIRM_ON_STOP);
+  // The couch overlay asks for confirmation itself, with the controller.
+  bool confirm_on_stop =
+      Config::Get(Config::MAIN_CONFIRM_ON_STOP) && !std::exchange(m_skip_stop_confirm, false);
 #ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
   confirm_on_stop = confirm_on_stop || AchievementManager::GetInstance().CheckForModifications();
 #endif  // RC_CLIENT_SUPPORTS_RAINTEGRATION
