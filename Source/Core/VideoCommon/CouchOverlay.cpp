@@ -372,17 +372,75 @@ struct Item
 
 struct Palette
 {
-  ImU32 dim = IM_COL32(0, 0, 0, 150);
-  ImU32 panel = IM_COL32(24, 24, 26, 245);
-  ImU32 row_hover = IM_COL32(255, 255, 255, 18);
-  ImU32 row_selected = IM_COL32(255, 255, 255, 30);
-  ImU32 accent = IM_COL32(64, 156, 255, 255);
-  ImU32 text = IM_COL32(236, 236, 240, 255);
-  ImU32 text_dim = IM_COL32(150, 150, 158, 255);
-  ImU32 text_disabled = IM_COL32(100, 100, 106, 255);
-  ImU32 warn = IM_COL32(255, 176, 64, 255);
+  ImU32 dim;            // full-screen veil over the game
+  ImU32 panel;          // list background
+  ImU32 row_hover;      // mouse hover
+  ImU32 row_selected;   // selected row
+  ImU32 accent;         // selection bar, choice arrows, hovered header icons
+  ImU32 text;
+  ImU32 text_dim;
+  ImU32 text_disabled;
+  ImU32 warn;           // "press A again" confirmations
+  ImU32 chrome;         // header/footer band; fully transparent keeps the xemu look
+  ImU32 chrome_text;    // header icons
+  ImU32 chrome_dim;     // header title and footer hints
 };
-constexpr Palette COLORS{};
+
+struct Theme
+{
+  const char* name;
+  Palette palette;
+};
+
+// clang-format off
+constexpr std::array THEMES = {
+  Theme{"Blue", {IM_COL32(0, 0, 0, 150), IM_COL32(24, 24, 26, 245), IM_COL32(255, 255, 255, 18),
+                 IM_COL32(255, 255, 255, 30), IM_COL32(64, 156, 255, 255), IM_COL32(236, 236, 240, 255),
+                 IM_COL32(150, 150, 158, 255), IM_COL32(100, 100, 106, 255), IM_COL32(255, 176, 64, 255),
+                 IM_COL32(0, 0, 0, 0), IM_COL32(236, 236, 240, 255), IM_COL32(170, 170, 178, 255)}},
+  Theme{"Dark", {IM_COL32(0, 0, 0, 185), IM_COL32(10, 10, 10, 250), IM_COL32(255, 255, 255, 14),
+                 IM_COL32(255, 255, 255, 26), IM_COL32(235, 235, 235, 255), IM_COL32(225, 225, 225, 255),
+                 IM_COL32(135, 135, 135, 255), IM_COL32(85, 85, 85, 255), IM_COL32(255, 176, 64, 255),
+                 IM_COL32(0, 0, 0, 0), IM_COL32(225, 225, 225, 255), IM_COL32(160, 160, 160, 255)}},
+  Theme{"Purple", {IM_COL32(8, 0, 20, 150), IM_COL32(30, 24, 42, 245), IM_COL32(200, 170, 255, 18),
+                   IM_COL32(190, 150, 255, 38), IM_COL32(170, 120, 255, 255), IM_COL32(240, 236, 250, 255),
+                   IM_COL32(160, 150, 182, 255), IM_COL32(105, 98, 122, 255), IM_COL32(255, 176, 64, 255),
+                   IM_COL32(0, 0, 0, 0), IM_COL32(240, 236, 250, 255), IM_COL32(182, 172, 204, 255)}},
+  Theme{"Green", {IM_COL32(0, 10, 0, 150), IM_COL32(22, 28, 22, 245), IM_COL32(160, 255, 120, 16),
+                  IM_COL32(98, 202, 19, 40), IM_COL32(98, 202, 19, 255), IM_COL32(234, 242, 232, 255),
+                  IM_COL32(148, 162, 146, 255), IM_COL32(98, 110, 96, 255), IM_COL32(255, 176, 64, 255),
+                  IM_COL32(0, 0, 0, 0), IM_COL32(234, 242, 232, 255), IM_COL32(170, 184, 168, 255)}},
+  Theme{"Red", {IM_COL32(16, 0, 0, 150), IM_COL32(34, 22, 24, 245), IM_COL32(255, 160, 160, 16),
+                IM_COL32(240, 80, 80, 38), IM_COL32(240, 76, 76, 255), IM_COL32(244, 236, 236, 255),
+                IM_COL32(170, 150, 152, 255), IM_COL32(118, 100, 102, 255), IM_COL32(255, 196, 80, 255),
+                IM_COL32(0, 0, 0, 0), IM_COL32(244, 236, 236, 255), IM_COL32(190, 172, 174, 255)}},
+  Theme{"Gold", {IM_COL32(12, 8, 0, 150), IM_COL32(32, 28, 20, 245), IM_COL32(255, 220, 140, 16),
+                 IM_COL32(255, 186, 60, 36), IM_COL32(255, 184, 48, 255), IM_COL32(246, 240, 228, 255),
+                 IM_COL32(170, 160, 140, 255), IM_COL32(116, 108, 92, 255), IM_COL32(255, 120, 90, 255),
+                 IM_COL32(0, 0, 0, 0), IM_COL32(246, 240, 228, 255), IM_COL32(190, 180, 160, 255)}},
+  Theme{"Light", {IM_COL32(0, 0, 0, 110), IM_COL32(244, 244, 247, 250), IM_COL32(0, 0, 0, 12),
+                  IM_COL32(0, 90, 200, 30), IM_COL32(0, 110, 215, 255), IM_COL32(24, 24, 28, 255),
+                  IM_COL32(96, 96, 106, 255), IM_COL32(165, 165, 172, 255), IM_COL32(200, 100, 0, 255),
+                  IM_COL32(228, 228, 234, 250), IM_COL32(24, 24, 28, 255), IM_COL32(96, 96, 106, 255)}},
+};
+// clang-format on
+
+// Saved in Dolphin.ini under [CouchOverlay]; lives here so no core settings file changes.
+const Config::Info<std::string> COUCH_THEME{{Config::System::Main, "CouchOverlay", "Theme"},
+                                            "Blue"};
+
+size_t ThemeIndex(const std::string& name)
+{
+  for (size_t i = 0; i < THEMES.size(); ++i)
+  {
+    if (name == THEMES[i].name)
+      return i;
+  }
+  return 0;
+}
+
+// Video thread only; refreshed from the config at the start of every Draw().
+Palette COLORS = THEMES[0].palette;
 
 void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col)
 {
@@ -782,6 +840,18 @@ void BuildSettings(std::vector<Item>& items)
                        SetSetting(Config::MAIN_EMULATION_SPEED, speeds[next]);
                      }});
   }
+  // Menu theme
+  {
+    const size_t idx = ThemeIndex(Config::Get(COUCH_THEME));
+    items.push_back({.id = "theme",
+                     .label = "Menu Theme",
+                     .value = THEMES[idx].name,
+                     .choice = true,
+                     .on_adjust = [idx](int dir) {
+                       const int next = Wrap(int(idx) + dir, int(THEMES.size()));
+                       SetSetting(COUCH_THEME, std::string(THEMES[next].name));
+                     }});
+  }
   items.push_back({.id = "fullscreen",
                    .label = "Toggle Fullscreen",
                    .on_accept = [] { PushHostActionLocked(HostAction::FullScreen); }});
@@ -1123,6 +1193,8 @@ void Draw()
   if (!s_open || s_pages.empty())
     return;
 
+  COLORS = THEMES[ThemeIndex(Config::Get(COUCH_THEME))].palette;
+
   ImGuiIO& io = ImGui::GetIO();
   const float W = io.DisplaySize.x, H = io.DisplaySize.y;
   const float ui = std::max(0.55f, std::min(W / 1920.0f, H / 1080.0f) * 1.25f);
@@ -1276,8 +1348,14 @@ void Draw()
           ImGui::IsMouseHoveringRect({back_c.x - hit, cy - hit}, {back_c.x + hit, cy + hit});
       const bool close_hover =
           ImGui::IsMouseHoveringRect({close_c.x - hit, cy - hit}, {close_c.x + hit, cy + hit});
-      DrawBackArrow(dl, back_c, icon_px, back_hover ? COLORS.accent : COLORS.text, stroke);
-      DrawCross(dl, close_c, icon_px, close_hover ? COLORS.accent : COLORS.text, stroke);
+      if ((COLORS.chrome >> IM_COL32_A_SHIFT) != 0)
+      {
+        dl->AddRectFilled(origin, {origin.x + panel_w, origin.y + header_h}, COLORS.chrome);
+        dl->AddRectFilled({origin.x, origin.y + total_h - footer_h},
+                          {origin.x + panel_w, origin.y + total_h}, COLORS.chrome);
+      }
+      DrawBackArrow(dl, back_c, icon_px, back_hover ? COLORS.accent : COLORS.chrome_text, stroke);
+      DrawCross(dl, close_c, icon_px, close_hover ? COLORS.accent : COLORS.chrome_text, stroke);
 
       std::string title = PageTitle(page.id);
       if (title.empty())
@@ -1293,7 +1371,7 @@ void Draw()
           ts = font->CalcTextSizeA(small_px, FLT_MAX, 0.0f, title.c_str());
         }
         dl->AddText(font, small_px, {origin.x + (panel_w - ts.x) * 0.5f, cy - ts.y * 0.5f},
-                    COLORS.text_dim, title.c_str());
+                    COLORS.chrome_dim, title.c_str());
       }
 
       if (clicked && back_hover)
@@ -1409,7 +1487,7 @@ void Draw()
       const auto hint = [&](const char* glyph, ImU32 col, const char* text) {
         x += DrawButtonGlyph(dl, font, {x, gy}, g, glyph, col) + 8.0f * ui;
         const ImVec2 ts = font->CalcTextSizeA(small_px, FLT_MAX, 0.0f, text);
-        dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.text_dim, text);
+        dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.chrome_dim, text);
         x += ts.x + 22.0f * ui;
       };
       hint("A", IM_COL32(96, 186, 72, 255), "Select");
@@ -1419,12 +1497,12 @@ void Draw()
         const char* t = "Change";
         const ImVec2 ts = font->CalcTextSizeA(small_px, FLT_MAX, 0.0f, t);
         const float cx = x + g * 0.5f;
-        DrawChevron(dl, {cx - g * 0.25f, gy + g * 0.5f}, g * 0.6f, COLORS.text_dim, false,
+        DrawChevron(dl, {cx - g * 0.25f, gy + g * 0.5f}, g * 0.6f, COLORS.chrome_dim, false,
                     stroke * 0.8f);
-        DrawChevron(dl, {cx + g * 0.25f, gy + g * 0.5f}, g * 0.6f, COLORS.text_dim, true,
+        DrawChevron(dl, {cx + g * 0.25f, gy + g * 0.5f}, g * 0.6f, COLORS.chrome_dim, true,
                     stroke * 0.8f);
         x += g + 8.0f * ui;
-        dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.text_dim, t);
+        dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.chrome_dim, t);
       }
     }
   }
