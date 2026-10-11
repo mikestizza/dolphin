@@ -11,6 +11,8 @@
 
 #pragma once
 
+struct ImFont;
+
 namespace Core
 {
 class System;
@@ -56,4 +58,11 @@ unsigned PollDialogNav();
 
 // Video thread, with the ImGui lock held, between NewFrame and Render.
 void Draw();
+
+// Video thread, right after the ImGui context and its default font are created. Adds the menu's
+// UI font: <User>/Load/CouchOverlay_Font.ttf if present, else Segoe UI on Windows, else none
+// (the OSD font is used).
+void LoadFonts();
+// Uses the given font for the menu (nullptr = the default ImGui font).
+void UseFont(ImFont* font);
 }  // namespace CouchOverlay

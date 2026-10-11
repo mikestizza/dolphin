@@ -10,6 +10,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -26,8 +27,10 @@
 #include <imgui.h>
 
 #include "AudioCommon/AudioCommon.h"
+#include "Common/CommonPaths.h"
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
 #include "Common/StringUtil.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
@@ -116,6 +119,9 @@ bool s_disc_scanned = false;
 std::atomic<bool> s_redraw_queued{false};
 Clock::time_point s_redraw_queued_at;
 Clock::time_point s_last_redraw_request;
+
+// Video thread only.
+ImFont* s_font = nullptr;
 
 // Host-thread-only input repeat state.
 struct RepeatState
@@ -347,7 +353,6 @@ enum class Icon
   Restart,
   Exit,
   Undo,
-  Fullscreen,
 };
 
 struct Item
@@ -455,20 +460,6 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col)
     dl->PathStroke(col, 0, t);
     dl->AddLine({c.x, c.y - r * 0.95f}, {c.x, c.y - r * 0.1f}, col, t);
     break;
-  case Icon::Fullscreen:
-  {
-    const float k = r * 0.4f;
-    for (int sx = -1; sx <= 1; sx += 2)
-    {
-      for (int sy = -1; sy <= 1; sy += 2)
-      {
-        const ImVec2 corner{c.x + sx * r * 0.85f, c.y + sy * r * 0.7f};
-        dl->AddLine(corner, {corner.x - sx * k, corner.y}, col, t);
-        dl->AddLine(corner, {corner.x, corner.y - sy * k}, col, t);
-      }
-    }
-    break;
-  }
   }
 }
 
@@ -477,6 +468,13 @@ void DrawChevron(ImDrawList* dl, ImVec2 c, float s, ImU32 col, bool right, float
   const float dx = right ? s * 0.25f : -s * 0.25f;
   dl->AddLine({c.x - dx, c.y - s * 0.45f}, {c.x + dx, c.y}, col, thickness);
   dl->AddLine({c.x + dx, c.y}, {c.x - dx, c.y + s * 0.45f}, col, thickness);
+}
+
+void DrawChevronV(ImDrawList* dl, ImVec2 c, float s, ImU32 col, bool down, float thickness)
+{
+  const float dy = down ? s * 0.25f : -s * 0.25f;
+  dl->AddLine({c.x - s * 0.45f, c.y - dy}, {c.x, c.y + dy}, col, thickness);
+  dl->AddLine({c.x, c.y + dy}, {c.x + s * 0.45f, c.y - dy}, col, thickness);
 }
 
 void DrawCross(ImDrawList* dl, ImVec2 c, float s, ImU32 col, float thickness)
@@ -579,7 +577,7 @@ void BuildMain(std::vector<Item>& items, std::vector<PageState>& pages)
   items.push_back({.id = "restart",
                    .label = "Restart",
                    .icon = Icon::Restart,
-                   .confirm = "Press again to restart",
+                   .confirm = "Press A again to restart",
                    .on_accept = [] {
                      PushHostActionLocked(HostAction::Reset);
                      CloseLocked(true);
@@ -587,7 +585,7 @@ void BuildMain(std::vector<Item>& items, std::vector<PageState>& pages)
   items.push_back({.id = "exit",
                    .label = "Exit",
                    .icon = Icon::Exit,
-                   .confirm = "Press again to exit",
+                   .confirm = "Press A again to exit",
                    .on_accept = [] {
                      PushHostActionLocked(HostAction::Exit);
                      CloseLocked(false);
@@ -607,7 +605,7 @@ void BuildSlots(std::vector<Item>& items, bool save)
     if (save)
     {
       if (s_slot_used[i])
-        item.confirm = "Press again to overwrite";
+        item.confirm = fmt::format("Slot {}: press A again to overwrite", slot);
       item.on_accept = [slot] {
         PushHostActionLocked(HostAction::StateSave, slot);
         // Re-read the slot list once the save has had time to land on disk.
@@ -786,7 +784,6 @@ void BuildSettings(std::vector<Item>& items)
   }
   items.push_back({.id = "fullscreen",
                    .label = "Toggle Fullscreen",
-                   .icon = Icon::Fullscreen,
                    .on_accept = [] { PushHostActionLocked(HostAction::FullScreen); }});
 }
 
@@ -901,6 +898,39 @@ float PixelFontSize(float px)
 bool IsOpen()
 {
   return s_open.load();
+}
+
+void UseFont(ImFont* font)
+{
+  s_font = font;
+}
+
+void LoadFonts()
+{
+  s_font = nullptr;
+  std::vector<std::string> candidates = {File::GetUserPath(D_LOAD_IDX) + "CouchOverlay_Font.ttf",
+                                         File::GetUserPath(D_LOAD_IDX) + "CouchOverlay_Font.otf"};
+#ifdef _WIN32
+  if (const char* windir = std::getenv("WINDIR"))
+  {
+    candidates.push_back(std::string(windir) + "\\Fonts\\seguisb.ttf");  // Segoe UI Semibold
+    candidates.push_back(std::string(windir) + "\\Fonts\\segoeui.ttf");
+  }
+#endif
+  ImGuiIO& io = ImGui::GetIO();
+  for (const std::string& path : candidates)
+  {
+    if (!File::Exists(path))
+      continue;
+    // The first font in the atlas is ImGui's default for everything else; keep it the OSD font.
+    if (io.Fonts->Fonts.empty())
+      io.Fonts->AddFontDefault();
+    if (ImFont* font = io.Fonts->AddFontFromFileTTF(path.c_str()))
+    {
+      s_font = font;
+      return;
+    }
+  }
 }
 
 void Toggle(Core::System& system)
@@ -1175,19 +1205,18 @@ void Draw()
   // reference stays valid.
   PageState& page = s_pages.back();
 
-  // ---- Layout ----
-  ImFont* font = ImGui::GetFont();
-  const float row_h = 58.0f * ui;
-  const float font_px = 30.0f * ui;
-  const float small_px = 20.0f * ui;
-  const float icon_px = 26.0f * ui;
-  const float pad_x = 22.0f * ui;
-  const float header_h = 54.0f * ui;
-  const float footer_h = 46.0f * ui;
-  const float panel_w =
-      std::min(W - 40.0f * ui, (page.id == PageId::Main ? 520.0f : 760.0f) * ui);
+  // ---- Layout ---- (whole pixels, so edges stay crisp at any scale)
+  const auto px = [ui](float v) { return std::round(v * ui); };
+  const float row_h = px(58.0f);
+  const float font_px = px(31.0f);
+  const float small_px = px(20.0f);
+  const float icon_px = px(26.0f);
+  const float pad_x = px(22.0f);
+  const float header_h = px(54.0f);
+  const float footer_h = px(46.0f);
+  const float panel_w = std::min(W - px(40.0f), px(page.id == PageId::Main ? 520.0f : 760.0f));
 
-  const int max_rows = std::max(3, int((H * 0.78f - header_h - footer_h) / row_h));
+  const int max_rows = std::max(3, int((H * 0.9f - header_h - footer_h) / row_h));
   const int n_items = int(items.size());
   const int visible = std::min(n_items, max_rows);
   if (n_items > 0)
@@ -1219,7 +1248,8 @@ void Draw()
   // Dim the game behind the menu.
   ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {W, H}, COLORS.dim);
 
-  ImGui::PushFont(nullptr, PixelFontSize(font_px));
+  ImGui::PushFont(s_font, PixelFontSize(font_px));
+  ImFont* const font = ImGui::GetFont();
   ImGui::SetNextWindowPos(origin);
   ImGui::SetNextWindowSize({panel_w, total_h});
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
@@ -1364,11 +1394,11 @@ void Draw()
 
     // Scroll hints.
     if (page.scroll > 0)
-      DrawChevron(dl, {origin.x + panel_w * 0.5f, list_top + 8.0f * ui}, 14.0f * ui,
-                  COLORS.text_dim, true, stroke);
+      DrawChevronV(dl, {origin.x + panel_w * 0.5f, list_top + px(9.0f)}, px(16.0f),
+                   COLORS.text_dim, false, stroke);
     if (page.scroll + visible < n_items)
-      DrawChevron(dl, {origin.x + panel_w * 0.5f, list_top + list_h - 8.0f * ui}, 14.0f * ui,
-                  COLORS.text_dim, false, stroke);
+      DrawChevronV(dl, {origin.x + panel_w * 0.5f, list_top + list_h - px(9.0f)}, px(16.0f),
+                   COLORS.text_dim, true, stroke);
 
     // Footer: controller hints.
     {

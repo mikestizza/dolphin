@@ -96,6 +96,7 @@ bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
     io.Fonts->Clear();
     io.Fonts->AddFontFromFileTTF(file.c_str());
   }
+  CouchOverlay::LoadFonts();
 
   // Setup new font management behavior
   io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_RendererHasVtxOffset;
