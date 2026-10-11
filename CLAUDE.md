@@ -78,6 +78,8 @@ Logs: enable in View > Show Log / Log Configuration, or read `testuser\Logs\dolp
   predate it. Start or B on the top page also closes it.
 - Opening pauses emulation. Closing resumes only after the closing button is released, so the
   press never reaches the game.
+- The menu reopens where it was closed (page stack and selected row) while the same game runs;
+  `PrepareMenuLocked()` resets it for a different game ID and refreshes restored pages' data.
 - Pages: Main (Resume, Screenshot, Save State, Load State, Change Disc, Settings, Restart, Exit),
   Save/Load State (10 slots, overwrite confirm, Undo Load State), Change Disc (m3u set, or sibling
   files whose names differ only by a "(Disc N)" tag), Settings.
@@ -165,9 +167,10 @@ fullscreen, save/load/overwrite/undo, live settings that persist, Change Disc, R
 `-b` (no dialog), pad-driven stop confirmation, all themes. Per-game settings (first version)
 were tested too.
 
-To test next: X/Y on settings rows, Make This the Default, Reset This Game, the baseline on first
-launch (check `[CouchOverlay] BaselineVersion = 1` and the values in Dolphin.ini / GFX.ini), menu
-sounds at each level and custom WAVs, Light theme at 4K.
+Also tested: X/Y on settings rows, Make This the Default, Reset This Game, the baseline on first
+launch, menu sounds, and reopening the menu at the last position.
+
+Still untested: custom sound WAVs, Light theme at 4K.
 
 Known gaps / ideas:
 - Windows "Open Xbox Game Bar with the controller button" can also fire on guide; turn it off in
