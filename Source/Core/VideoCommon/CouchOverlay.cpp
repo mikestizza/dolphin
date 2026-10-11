@@ -16,15 +16,22 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <fmt/format.h>
 #include <imgui.h>
+
+#ifdef _WIN32
+#include <Windows.h>
+#include <mmsystem.h>
+#endif
 
 #include "AudioCommon/AudioCommon.h"
 #include "Common/CommonPaths.h"
@@ -39,6 +46,7 @@
 #include "Core/HW/CPU.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GCPad.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/State.h"
 #include "Core/System.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
@@ -67,6 +75,8 @@ enum class Nav
   Accept,
   Back,
   Close,
+  Promote,  // X: make the selected setting the system default
+  Revert,   // Y: drop this game's override of the selected setting
 };
 
 enum class PageId
@@ -76,7 +86,19 @@ enum class PageId
   LoadState,
   ChangeDisc,
   Settings,
+  Graphics,
+  Enhancements,
+  Performance,
+  Hacks,
+  OnScreenDisplay,
+  Emulation,
+  Audio,
+  Controls,
 };
+
+constexpr std::array SETTINGS_CATEGORIES = {
+    PageId::Graphics,        PageId::Enhancements, PageId::Performance, PageId::Hacks,
+    PageId::OnScreenDisplay, PageId::Emulation,    PageId::Audio,       PageId::Controls};
 
 struct PageState
 {
@@ -115,6 +137,15 @@ std::vector<std::string> s_disc_paths;
 std::string s_current_disc;
 bool s_disc_scanned = false;
 
+// Keys set in this game's LocalGame config layer (its User/GameSettings INI). Refreshed on the UI
+// thread, which owns the config, after every change.
+std::set<Config::Location> s_overridden;
+
+// Choices for the settings pages that come from disk, gathered on the host thread.
+bool s_lists_refresh_requested = false;
+std::vector<std::string> s_shader_names;
+std::vector<std::string> s_profile_names;
+
 // Paused redraw bookkeeping.
 std::atomic<bool> s_redraw_queued{false};
 Clock::time_point s_redraw_queued_at;
@@ -131,6 +162,164 @@ struct RepeatState
 };
 std::array<RepeatState, 4> s_dir_repeat;
 bool s_prev_accept = false, s_prev_back = false, s_prev_start = false;
+bool s_prev_promote = false, s_prev_revert = false;
+
+// Menu-wide preferences, saved in Dolphin.ini under [CouchOverlay]. They live here so no core
+// settings file changes.
+const Config::Info<std::string> COUCH_THEME{{Config::System::Main, "CouchOverlay", "Theme"},
+                                            "Blue"};
+// 0 = off, 1-3 = quiet to loud.
+const Config::Info<int> COUCH_SOUND_LEVEL{{Config::System::Main, "CouchOverlay", "Sounds"}, 2};
+// Which Couch Potato baseline (see ApplyBaselineValues) this config has received.
+const Config::Info<int> COUCH_BASELINE_VERSION{
+    {Config::System::Main, "CouchOverlay", "BaselineVersion"}, 0};
+constexpr int BASELINE_VERSION = 1;
+
+// ---------------------------------------------------------------------------------------------
+// Menu sounds
+// ---------------------------------------------------------------------------------------------
+
+// In increasing priority: when several land in one frame, the most important one plays.
+enum class Sound
+{
+  Move,
+  Change,
+  Deny,
+  Select,
+  Back,
+  Open,
+  Close,
+};
+constexpr size_t NUM_SOUNDS = 7;
+constexpr std::array<const char*, NUM_SOUNDS> SOUND_NAMES = {"move", "change", "deny", "select",
+                                                             "back", "open",   "close"};
+
+std::optional<Sound> s_pending_sound;  // guarded by s_mutex; played on the host thread
+
+void QueueSoundLocked(Sound sound)
+{
+  if (!s_pending_sound || *s_pending_sound < sound)
+    s_pending_sound = sound;
+}
+
+// Host thread only. Buffers are never freed, because PlaySound reads them while playing.
+struct SoundBank
+{
+  std::array<std::vector<u8>, NUM_SOUNDS> wav;
+};
+std::array<std::optional<SoundBank>, 4> s_generated;  // per level
+std::optional<std::array<std::vector<u8>, NUM_SOUNDS>> s_custom;
+
+std::vector<u8> MakeWav(const std::vector<s16>& samples, u32 rate)
+{
+  std::vector<u8> out;
+  const auto put = [&out](u32 v, int bytes) {
+    for (int i = 0; i < bytes; ++i)
+      out.push_back(u8(v >> (8 * i)));
+  };
+  const u32 data_size = u32(samples.size() * sizeof(s16));
+  out.insert(out.end(), {'R', 'I', 'F', 'F'});
+  put(36 + data_size, 4);
+  out.insert(out.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
+  put(16, 4);        // fmt chunk size
+  put(1, 2);         // PCM
+  put(1, 2);         // mono
+  put(rate, 4);      // sample rate
+  put(rate * 2, 4);  // byte rate
+  put(2, 2);         // block align
+  put(16, 2);        // bits per sample
+  out.insert(out.end(), {'d', 'a', 't', 'a'});
+  put(data_size, 4);
+  for (s16 v : samples)
+    put(u16(v), 2);
+  return out;
+}
+
+// A short pitched blip with a soft attack and exponential decay, plus a touch of noise for the
+// "click" edge. f0 -> f1 is a linear pitch sweep.
+std::vector<s16> Blip(float f0, float f1, float ms, float gain, float decay, float noise)
+{
+  constexpr u32 rate = 44100;
+  const int n = int(rate * ms / 1000.0f);
+  std::vector<s16> out(n + int(rate * 0.004f), 0);  // short silent tail avoids an end pop
+  float phase = 0.0f;
+  u32 rng = 0x12345678;
+  for (int i = 0; i < n; ++i)
+  {
+    const float t = float(i) / float(n);
+    phase += 2.0f * 3.14159265f * (f0 + (f1 - f0) * t) / float(rate);
+    rng = rng * 1664525u + 1013904223u;
+    const float white = float(rng >> 8) / float(1u << 24) * 2.0f - 1.0f;
+    const float attack = std::min(1.0f, float(i) / (rate * 0.0015f));
+    const float env = attack * std::exp(-decay * t) * (1.0f - t * t);
+    const float v = (std::sin(phase) * (1.0f - noise) + white * noise * std::exp(-12.0f * t));
+    out[i] = s16(std::clamp(v * env * gain, -1.0f, 1.0f) * 32767.0f);
+  }
+  return out;
+}
+
+const SoundBank& GeneratedSounds(int level)
+{
+  auto& bank = s_generated[level];
+  if (!bank)
+  {
+    static constexpr std::array<float, 4> gains = {0.0f, 0.10f, 0.20f, 0.36f};
+    const float g = gains[level];
+    bank.emplace();
+    const auto set = [&](Sound s, std::vector<s16> samples) {
+      bank->wav[size_t(s)] = MakeWav(samples, 44100);
+    };
+    // Kodi/RetroArch-style: tiny high ticks for movement, rounder blips for actions.
+    set(Sound::Move, Blip(1900.0f, 1700.0f, 16.0f, g * 0.8f, 7.0f, 0.25f));
+    set(Sound::Change, Blip(2500.0f, 2300.0f, 18.0f, g * 0.8f, 6.0f, 0.2f));
+    set(Sound::Deny, Blip(210.0f, 180.0f, 80.0f, g * 0.9f, 3.0f, 0.05f));
+    set(Sound::Select, Blip(1050.0f, 1600.0f, 55.0f, g, 4.0f, 0.1f));
+    set(Sound::Back, Blip(1300.0f, 800.0f, 55.0f, g, 4.0f, 0.1f));
+    set(Sound::Open, Blip(520.0f, 1250.0f, 120.0f, g, 2.5f, 0.05f));
+    set(Sound::Close, Blip(1250.0f, 520.0f, 120.0f, g, 2.5f, 0.05f));
+  }
+  return *bank;
+}
+
+// <User>/Load/CouchOverlay/Sounds/<name>.wav replaces the built-in sound of that name.
+void LoadCustomSounds()
+{
+  s_custom.emplace();
+  const std::string dir = File::GetUserPath(D_LOAD_IDX) + "CouchOverlay/Sounds/";
+  for (size_t i = 0; i < NUM_SOUNDS; ++i)
+  {
+    std::string data;
+    if (File::ReadFileToString(dir + SOUND_NAMES[i] + ".wav", data))
+      (*s_custom)[i].assign(data.begin(), data.end());
+  }
+}
+
+// Host thread.
+void PlayPendingSound()
+{
+  std::optional<Sound> sound;
+  {
+    std::lock_guard lk(s_mutex);
+    sound = std::exchange(s_pending_sound, std::nullopt);
+  }
+  if (!sound)
+    return;
+  const int level = std::clamp(Config::Get(COUCH_SOUND_LEVEL), 0, 3);
+  if (level == 0)
+    return;
+  if (!s_custom)
+    LoadCustomSounds();
+  const size_t i = size_t(*sound);
+  const std::vector<u8>& wav =
+      !(*s_custom)[i].empty() ? (*s_custom)[i] : GeneratedSounds(level).wav[i];
+#ifdef _WIN32
+  // Async: a new sound cuts off the previous one, which suits quick menu ticks.
+  PlaySoundW(reinterpret_cast<LPCWSTR>(wav.data()), nullptr,
+             SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+#else
+  (void)wav;
+#endif
+}
 
 // ---------------------------------------------------------------------------------------------
 // Helpers usable from any thread
@@ -162,6 +351,7 @@ void SaveConfigIfDirtyLocked()
 // menu are released, so the confirming press never reaches the game.
 void CloseLocked(bool resume)
 {
+  QueueSoundLocked(Sound::Close);
   SaveConfigIfDirtyLocked();
   s_open = false;
   s_nav_events.clear();
@@ -282,6 +472,43 @@ void RefreshSlotsOnHost()
   s_slot_used = used;
 }
 
+void RefreshSettingsListsOnHost()
+{
+  std::vector<std::string> shaders = VideoCommon::PostProcessing::GetShaderList();
+
+  // GameCube controller profiles, named the way a game INI's PadProfile1 key refers to them.
+  std::vector<std::string> profiles;
+  std::error_code ec;
+  const std::filesystem::path dir =
+      StringToPath(File::GetUserPath(D_CONFIG_IDX) + "Profiles/GCPad");
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+  {
+    if (entry.is_regular_file(ec) && Lower(PathToString(entry.path().extension())) == ".ini")
+      profiles.push_back(PathToString(entry.path().stem()));
+  }
+  std::ranges::sort(profiles);
+
+  std::lock_guard lk(s_mutex);
+  s_shader_names = std::move(shaders);
+  s_profile_names = std::move(profiles);
+}
+
+// UI thread.
+void RefreshOverrides()
+{
+  std::set<Config::Location> keys;
+  if (const auto layer = Config::GetLayer(Config::LayerType::LocalGame))
+  {
+    for (const auto& [location, value] : layer->GetLayerMap())
+    {
+      if (value)
+        keys.insert(location);
+    }
+  }
+  std::lock_guard lk(s_mutex);
+  s_overridden = std::move(keys);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Controller reading (host thread)
 // ---------------------------------------------------------------------------------------------
@@ -289,7 +516,7 @@ void RefreshSlotsOnHost()
 struct NavButtons
 {
   bool up = false, down = false, left = false, right = false;
-  bool accept = false, back = false, start = false;
+  bool accept = false, back = false, start = false, promote = false, revert = false;
 };
 
 NavButtons ReadNavButtons()
@@ -314,6 +541,8 @@ NavButtons ReadNavButtons()
     b.accept = get("Button A") > 0.5;
     b.back = get("Button B") > 0.5;
     b.start = get("Start") > 0.5;
+    b.promote = get("Button X") > 0.5;
+    b.revert = get("Button Y") > 0.5;
     return b;
   }
 
@@ -329,12 +558,15 @@ NavButtons ReadNavButtons()
   b.accept = pad.button & PAD_BUTTON_A;
   b.back = pad.button & PAD_BUTTON_B;
   b.start = pad.button & PAD_BUTTON_START;
+  b.promote = pad.button & PAD_BUTTON_X;
+  b.revert = pad.button & PAD_BUTTON_Y;
   return b;
 }
 
 bool AnyHeld(const NavButtons& b)
 {
-  return b.up || b.down || b.left || b.right || b.accept || b.back || b.start;
+  return b.up || b.down || b.left || b.right || b.accept || b.back || b.start || b.promote ||
+         b.revert;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,6 +600,10 @@ struct Item
   std::string confirm;  // non-empty: first press arms, second press runs
   std::function<void()> on_accept;
   std::function<void(int)> on_adjust;
+  std::vector<Config::Location> settings;  // config keys a settings row writes
+  bool overridden = false;                 // this game's INI sets one of them
+  bool promotable = false;                 // ...and the value can become the system default
+  bool next_launch = false;                // only read when a game boots
 };
 
 struct Palette
@@ -424,10 +660,6 @@ constexpr std::array THEMES = {
                   IM_COL32(228, 228, 234, 250), IM_COL32(24, 24, 28, 255), IM_COL32(96, 96, 106, 255)}},
 };
 // clang-format on
-
-// Saved in Dolphin.ini under [CouchOverlay]; lives here so no core settings file changes.
-const Config::Info<std::string> COUCH_THEME{{Config::System::Main, "CouchOverlay", "Theme"},
-                                            "Blue"};
 
 size_t ThemeIndex(const std::string& name)
 {
@@ -562,18 +794,6 @@ float DrawButtonGlyph(ImDrawList* dl, ImFont* font, ImVec2 pos, float size, cons
   return size;
 }
 
-// ----- Settings helpers -----
-
-template <typename T>
-void SetSetting(const Config::Info<T>& info, std::type_identity_t<T> value)
-{
-  // Config is owned by the UI thread; apply there. The paused CPU thread picks the change up the
-  // next time we wake it for a redraw, so graphics settings preview live behind the menu.
-  Core::QueueHostJob(
-      [&info, value](Core::System&) { Config::SetBaseOrCurrent(info, value); }, false);
-  s_config_dirty = true;
-}
-
 std::string OnOff(bool v)
 {
   return v ? "On" : "Off";
@@ -584,12 +804,250 @@ int Wrap(int v, int n)
   return ((v % n) + n) % n;
 }
 
+// ----- Settings helpers -----
+//
+// Every change made from the menu is a per-game override. It goes to Dolphin's LocalGame config
+// layer, which is this game's User/GameSettings/<GameID>.ini (the file the game's Properties
+// dialog edits). "Make This the Default" promotes the overrides to the global config.
+//
+// Config is owned by the UI thread, so all writes happen there. The paused CPU thread picks a
+// change up the next time we wake it for a redraw, so graphics settings preview live behind the
+// menu.
+
+using ApplyFn = std::function<void(Config::LayerType layer, Core::System& system)>;
+
+void ChangeGameSettings(ApplyFn apply)
+{
+  Core::QueueHostJob(
+      [apply = std::move(apply)](Core::System& system) {
+        // Without a game layer (no game running) the change has nowhere else to go.
+        const Config::LayerType layer = Config::GetLayer(Config::LayerType::LocalGame) ?
+                                            Config::LayerType::LocalGame :
+                                            Config::LayerType::Base;
+        apply(layer, system);
+        RefreshOverrides();
+      },
+      false);
+  s_config_dirty = true;
+}
+
+// UI thread.
+template <typename T>
+void SetValue(Config::LayerType layer, const Config::Info<T>& info, const T& value)
+{
+  // A value set for this run only (Dolphin's settings windows do that when a game INI already
+  // sets the key) sits above the game layer and would hide the new one.
+  if (const auto run = Config::GetLayer(Config::LayerType::CurrentRun);
+      run && run->DeleteKey(info.GetLocation()))
+  {
+    Config::OnConfigChanged();
+  }
+  Config::Set(layer, info, value);
+}
+
+// Removes this game's overrides so the global values apply again.
+void ClearGameSettings(std::vector<Config::Location> locations)
+{
+  ChangeGameSettings(
+      [locations = std::move(locations)](Config::LayerType layer, Core::System& system) {
+        if (layer != Config::LayerType::LocalGame)
+          return;
+        const auto local = Config::GetLayer(layer);
+        bool changed = false;
+        for (const Config::Location& location : locations)
+          changed |= local->DeleteKey(location);
+        if (!changed)
+          return;
+        Config::OnConfigChanged();
+        AudioCommon::UpdateSoundStream(system);
+      });
+}
+
+// Copies this game's overrides into the global config and drops them from the game INI.
+void MakeGameSettingsDefault(std::vector<Config::Location> locations)
+{
+  ChangeGameSettings([locations = std::move(locations)](Config::LayerType layer, Core::System&) {
+    if (layer != Config::LayerType::LocalGame)
+      return;
+    const auto local = Config::GetLayer(Config::LayerType::LocalGame);
+    const auto base = Config::GetLayer(Config::LayerType::Base);
+    const auto builtin = Config::GetLayer(Config::LayerType::GlobalGame);
+    for (const Config::Location& location : locations)
+    {
+      // Controller profiles only exist per game.
+      if (location.system == Config::System::GameSettingsOnly)
+        continue;
+      const std::optional<std::string> value = local->Get<std::string>(location);
+      if (!value)
+        continue;
+      base->Set(location, *value);
+      // Dolphin's built-in settings for this game sit between the global config and the game
+      // INI. Keep the override when they set the key, so this game still uses the chosen value.
+      if (!builtin || !builtin->Exists(location))
+        local->DeleteKey(location);
+    }
+    Config::OnConfigChanged();
+  });
+}
+
+// The Couch Potato baseline: the global config every game starts from. Dolphin's built-in
+// per-game settings (Sys/GameSettings) still apply on top, so games that need slower but more
+// accurate options keep them. UI thread.
+void ApplyBaselineValues()
+{
+  Config::ConfigChangeCallbackGuard guard;
+  // Graphics
+  Config::SetBase(Config::GFX_EFB_SCALE, 3);
+  Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::Auto);
+  Config::SetBase(Config::GFX_VSYNC, true);
+  Config::SetBase(Config::GFX_MSAA, 4u);
+  Config::SetBase(Config::GFX_SSAA, false);
+  Config::SetBase(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropicFilteringMode::Force16x);
+  Config::SetBase(Config::GFX_ENABLE_PIXEL_LIGHTING, true);
+  Config::SetBase(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, true);
+  Config::SetBase(Config::GFX_HACK_COPY_EFB_SCALED, true);
+  Config::SetBase(Config::GFX_WIDESCREEN_HACK, false);
+  // No shader stutter.
+  Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+                  ShaderCompilationMode::AsynchronousUberShaders);
+  Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
+  Config::SetBase(Config::GFX_HIRES_TEXTURES, true);
+  // Emulation
+  Config::SetBase(Config::MAIN_CPU_THREAD, true);
+  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::DefaultCPUCore());
+  Config::SetBase(Config::MAIN_DSP_HLE, true);
+  Config::SetBase(Config::MAIN_SKIP_IPL, true);
+  Config::SetBase(Config::MAIN_ENABLE_CHEATS, true);
+  Config::SetBase(Config::MAIN_EMULATION_SPEED, 1.0f);
+  // Couch: no mouse, no desktop questions.
+  Config::SetBase(Config::MAIN_FULLSCREEN, true);
+  Config::SetBase(Config::MAIN_SHOW_CURSOR, Config::ShowCursor::Never);
+  Config::SetBase(Config::MAIN_CONFIRM_ON_STOP, false);
+  Config::SetBase(Config::MAIN_PAUSE_ON_FOCUS_LOST, false);
+
+  Config::SetBase(COUCH_BASELINE_VERSION, BASELINE_VERSION);
+}
+
+// For menu-wide preferences such as the theme, which are not per game.
+template <typename T>
+void SetGlobalSetting(const Config::Info<T>& info, std::type_identity_t<T> value)
+{
+  Core::QueueHostJob([&info, value](Core::System&) { Config::SetBase(info, value); }, false);
+  s_config_dirty = true;
+}
+
+Item SettingRow(std::string id, std::string label, std::vector<Config::Location> locations,
+                bool next_launch)
+{
+  Item item;
+  item.id = std::move(id);
+  item.label = std::move(label);
+  item.choice = true;
+  item.next_launch = next_launch;
+  item.overridden = std::ranges::any_of(
+      locations, [](const Config::Location& l) { return s_overridden.contains(l); });
+  // Controller profiles only exist per game.
+  item.promotable = std::ranges::any_of(locations, [](const Config::Location& l) {
+    return s_overridden.contains(l) && l.system != Config::System::GameSettingsOnly;
+  });
+  item.settings = std::move(locations);
+  return item;
+}
+
+// A row that shows invert ? !value : value as On/Off.
+Item BoolRow(std::string id, std::string label, const Config::Info<bool>& info,
+             bool next_launch = false, bool invert = false)
+{
+  const bool on = Config::Get(info) != invert;
+  Item item = SettingRow(std::move(id), std::move(label), {info.GetLocation()}, next_launch);
+  item.value = OnOff(on);
+  item.on_adjust = [&info, value = on == invert](int) {
+    ChangeGameSettings(
+        [&info, value](Config::LayerType layer, Core::System&) { SetValue(layer, info, value); });
+  };
+  return item;
+}
+
+template <typename T>
+using Choices = std::vector<std::pair<T, std::string>>;
+
+template <typename T>
+int FindChoice(const Choices<T>& choices, const T& value)
+{
+  for (size_t i = 0; i < choices.size(); ++i)
+  {
+    if constexpr (std::is_floating_point_v<T>)
+    {
+      if (std::abs(choices[i].first - value) < 0.001f)
+        return int(i);
+    }
+    else if (choices[i].first == value)
+    {
+      return int(i);
+    }
+  }
+  return -1;
+}
+
+int NextChoice(int idx, int dir, size_t n)
+{
+  return idx < 0 ? 0 : Wrap(idx + dir, int(n));
+}
+
+template <typename T>
+Item ChoiceRow(std::string id, std::string label, const Config::Info<T>& info, Choices<T> choices,
+               bool next_launch = false)
+{
+  const int idx = FindChoice(choices, Config::Get(info));
+  Item item = SettingRow(std::move(id), std::move(label), {info.GetLocation()}, next_launch);
+  item.value = idx < 0 ? "Custom" : choices[idx].second;
+  item.on_adjust = [&info, choices = std::move(choices), idx](int dir) {
+    const T value = choices[NextChoice(idx, dir, choices.size())].first;
+    ChangeGameSettings(
+        [&info, value](Config::LayerType layer, Core::System&) { SetValue(layer, info, value); });
+  };
+  return item;
+}
+
+std::string Percent(float v)
+{
+  return fmt::format("{:.0f}%", v * 100.0f);
+}
+
+// CPU clock and VBI frequency overrides: an enable flag plus a factor, shown as one row.
+Item OverrideRow(std::string id, std::string label, const Config::Info<bool>& enable,
+                 const Config::Info<float>& factor, std::vector<float> factors)
+{
+  Choices<float> choices;
+  for (float f : factors)
+    choices.emplace_back(f, Percent(f));
+  const bool on = Config::Get(enable);
+  const float cur = Config::Get(factor);
+  // Index 0 is Off; factors follow.
+  const int found = FindChoice(choices, cur);
+  const int idx = on ? (found < 0 ? -1 : found + 1) : 0;
+  Item item = SettingRow(std::move(id), std::move(label),
+                         {enable.GetLocation(), factor.GetLocation()}, false);
+  item.value = on ? Percent(cur) : "Off";
+  item.on_adjust = [&enable, &factor, factors = std::move(factors), idx](int dir) {
+    const int next = NextChoice(idx, dir, factors.size() + 1);
+    ChangeGameSettings([&enable, &factor, next, value = next > 0 ? factors[next - 1] : 1.0f](
+                           Config::LayerType layer, Core::System&) {
+      SetValue(layer, enable, next > 0);
+      if (next > 0)
+        SetValue(layer, factor, value);
+    });
+  };
+  return item;
+}
+
+std::function<void()> PushPage(std::vector<PageState>& pages, PageId id)
+{
+  return [&pages, id] { pages.push_back({id, 0, 0}); };
+}
+
 void BuildMain(std::vector<Item>& items, std::vector<PageState>& pages)
 {
-  auto push_page = [&pages](PageId id) {
-    return [&pages, id] { pages.push_back({id, 0, 0}); };
-  };
-
   items.push_back({.id = "resume",
                    .label = "Resume",
                    .icon = Icon::Resume,
@@ -631,7 +1089,11 @@ void BuildMain(std::vector<Item>& items, std::vector<PageState>& pages)
                    .label = "Settings",
                    .icon = Icon::Settings,
                    .submenu = true,
-                   .on_accept = push_page(PageId::Settings)});
+                   .on_accept = [&pages] {
+                     s_lists_refresh_requested = true;
+                     Core::QueueHostJob([](Core::System&) { RefreshOverrides(); }, false);
+                     pages.push_back({PageId::Settings, 0, 0});
+                   }});
   items.push_back({.id = "restart",
                    .label = "Restart",
                    .icon = Icon::Restart,
@@ -726,135 +1188,317 @@ void BuildDiscs(std::vector<Item>& items)
   }
 }
 
-void BuildSettings(std::vector<Item>& items)
+// Read by InputConfig when a game boots; a game INI can name a GameCube controller profile.
+const Config::Info<std::string> GAME_PAD_PROFILE_1{
+    {Config::System::GameSettingsOnly, "Controls", "PadProfile1"}, ""};
+
+void BuildGraphics(std::vector<Item>& items)
 {
-  // Aspect ratio
+  items.push_back(ChoiceRow<int>("efb", "Internal Resolution", Config::GFX_EFB_SCALE,
+                                 {{0, "Auto (Window)"},
+                                  {1, "Native (480p)"},
+                                  {2, "2x (720p)"},
+                                  {3, "3x (1080p)"},
+                                  {4, "4x (1440p)"},
+                                  {5, "5x (1620p)"},
+                                  {6, "6x (4K)"},
+                                  {7, "7x (3360p)"},
+                                  {8, "8x (5K)"}}));
+  items.push_back(ChoiceRow<AspectMode>("aspect", "Aspect Ratio", Config::GFX_ASPECT_RATIO,
+                                        {{AspectMode::Auto, "Auto"},
+                                         {AspectMode::ForceWide, "16:9"},
+                                         {AspectMode::ForceStandard, "4:3"},
+                                         {AspectMode::Stretch, "Stretch"}}));
+  items.push_back(BoolRow("wshack", "Widescreen Hack", Config::GFX_WIDESCREEN_HACK));
+  items.push_back(BoolRow("crop", "Crop to Aspect Ratio", Config::GFX_CROP_TO_ASPECT_RATIO));
+  items.push_back(BoolRow("vsync", "V-Sync", Config::GFX_VSYNC));
+  items.push_back(
+      BoolRow("borderless", "Borderless Fullscreen", Config::GFX_BORDERLESS_FULLSCREEN));
+}
+
+void BuildEnhancements(std::vector<Item>& items)
+{
+  // Anti-aliasing: MSAA sample count plus whether those samples are SSAA, shown as one row.
   {
-    static constexpr std::array modes = {AspectMode::Auto, AspectMode::ForceWide,
-                                         AspectMode::ForceStandard, AspectMode::Stretch};
-    static constexpr std::array names = {"Auto", "16:9", "4:3", "Stretch"};
-    const AspectMode cur = Config::Get(Config::GFX_ASPECT_RATIO);
-    const auto it = std::ranges::find(modes, cur);
-    const int idx = it == modes.end() ? -1 : int(it - modes.begin());
-    items.push_back({.id = "aspect",
-                     .label = "Aspect Ratio",
-                     .value = idx < 0 ? "Custom" : names[idx],
-                     .choice = true,
-                     .on_adjust = [idx](int dir) {
-                       const int next = Wrap((idx < 0 ? 0 : idx) + dir, int(modes.size()));
-                       SetSetting(Config::GFX_ASPECT_RATIO, modes[next]);
-                     }});
+    static const std::array<std::tuple<u32, bool, const char*>, 7> modes = {{{1, false, "Off"},
+                                                                             {2, false, "2x MSAA"},
+                                                                             {4, false, "4x MSAA"},
+                                                                             {8, false, "8x MSAA"},
+                                                                             {2, true, "2x SSAA"},
+                                                                             {4, true, "4x SSAA"},
+                                                                             {8, true, "8x SSAA"}}};
+    const u32 samples = Config::Get(Config::GFX_MSAA);
+    const bool ssaa = Config::Get(Config::GFX_SSAA);
+    int idx = -1;
+    for (size_t i = 0; i < modes.size(); ++i)
+    {
+      const u32 mode_samples = std::get<0>(modes[i]);
+      if ((samples <= 1 && mode_samples == 1) ||
+          (samples == mode_samples && ssaa == std::get<1>(modes[i])))
+      {
+        idx = int(i);
+        break;
+      }
+    }
+    Item item = SettingRow("aa", "Anti-Aliasing",
+                           {Config::GFX_MSAA.GetLocation(), Config::GFX_SSAA.GetLocation()}, false);
+    item.value = idx < 0 ? "Custom" : std::get<2>(modes[idx]);
+    item.on_adjust = [idx](int dir) {
+      const auto& mode = modes[NextChoice(idx, dir, modes.size())];
+      ChangeGameSettings([samples = std::get<0>(mode),
+                          ssaa = std::get<1>(mode)](Config::LayerType layer, Core::System&) {
+        SetValue(layer, Config::GFX_MSAA, samples);
+        SetValue(layer, Config::GFX_SSAA, ssaa);
+      });
+    };
+    items.push_back(std::move(item));
   }
-  // Widescreen hack
+  items.push_back(ChoiceRow<AnisotropicFilteringMode>(
+      "aniso", "Anisotropic Filtering", Config::GFX_ENHANCE_MAX_ANISOTROPY,
+      {{AnisotropicFilteringMode::Default, "Default"},
+       {AnisotropicFilteringMode::Force1x, "1x"},
+       {AnisotropicFilteringMode::Force2x, "2x"},
+       {AnisotropicFilteringMode::Force4x, "4x"},
+       {AnisotropicFilteringMode::Force8x, "8x"},
+       {AnisotropicFilteringMode::Force16x, "16x"}}));
+  items.push_back(ChoiceRow<TextureFilteringMode>(
+      "texfilter", "Texture Filtering", Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
+      {{TextureFilteringMode::Default, "Default"},
+       {TextureFilteringMode::Nearest, "Force Nearest"},
+       {TextureFilteringMode::Linear, "Force Linear"}}));
+  items.push_back(ChoiceRow<OutputResamplingMode>(
+      "resampling", "Output Resampling", Config::GFX_ENHANCE_OUTPUT_RESAMPLING,
+      {{OutputResamplingMode::Default, "Default"},
+       {OutputResamplingMode::Bilinear, "Bilinear"},
+       {OutputResamplingMode::BSpline, "Bicubic: B-Spline"},
+       {OutputResamplingMode::MitchellNetravali, "Bicubic: Mitchell"},
+       {OutputResamplingMode::CatmullRom, "Bicubic: Catmull-Rom"},
+       {OutputResamplingMode::SharpBilinear, "Sharp Bilinear"},
+       {OutputResamplingMode::AreaSampling, "Area Sampling"}}));
   {
-    const bool v = Config::Get(Config::GFX_WIDESCREEN_HACK);
-    items.push_back({.id = "wshack",
-                     .label = "Widescreen Hack",
-                     .value = OnOff(v),
-                     .choice = true,
-                     .on_adjust = [v](int) { SetSetting(Config::GFX_WIDESCREEN_HACK, !v); }});
-  }
-  // Internal resolution
-  {
-    static constexpr std::array names = {"Auto (Window)", "Native (480p)", "2x (720p)",
-                                         "3x (1080p)",    "4x (1440p)",    "5x (1620p)",
-                                         "6x (4K)",       "7x (3360p)",    "8x (5K)"};
-    const int v = std::clamp(Config::Get(Config::GFX_EFB_SCALE), 0, int(names.size()) - 1);
-    items.push_back({.id = "efb",
-                     .label = "Internal Resolution",
-                     .value = names[v],
-                     .choice = true,
-                     .on_adjust = [v](int dir) {
-                       SetSetting(Config::GFX_EFB_SCALE, Wrap(v + dir, int(names.size())));
-                     }});
-  }
-  // Post-processing shader
-  {
-    std::vector<std::string> shaders = VideoCommon::PostProcessing::GetShaderList();
-    shaders.insert(shaders.begin(), "");
+    Choices<std::string> shaders = {{"", "None"}};
+    for (const std::string& name : s_shader_names)
+      shaders.emplace_back(name, name);
     const std::string cur = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
-    const auto it = std::ranges::find(shaders, cur);
-    const int idx = it == shaders.end() ? 0 : int(it - shaders.begin());
-    items.push_back({.id = "shader",
-                     .label = "Shader",
-                     .value = cur.empty() ? "None" : cur,
-                     .choice = true,
-                     .on_adjust = [shaders, idx](int dir) {
-                       const int next = Wrap(idx + dir, int(shaders.size()));
-                       SetSetting(Config::GFX_ENHANCE_POST_SHADER, shaders[next]);
-                     }});
+    if (FindChoice(shaders, cur) < 0)
+      shaders.emplace_back(cur, cur);
+    items.push_back(ChoiceRow<std::string>("shader", "Post-Processing Shader",
+                                           Config::GFX_ENHANCE_POST_SHADER, std::move(shaders)));
   }
-  // V-Sync
+  items.push_back(BoolRow("hdr", "HDR Post-Processing", Config::GFX_ENHANCE_HDR_OUTPUT));
+  items.push_back(BoolRow("efbscaled", "Scaled EFB Copy", Config::GFX_HACK_COPY_EFB_SCALED));
+  items.push_back(BoolRow("pixellight", "Per-Pixel Lighting", Config::GFX_ENABLE_PIXEL_LIGHTING));
+  items.push_back(BoolRow("truecolor", "Force 24-Bit Color", Config::GFX_ENHANCE_FORCE_TRUE_COLOR));
+  items.push_back(
+      BoolRow("copyfilter", "Disable Copy Filter", Config::GFX_ENHANCE_DISABLE_COPY_FILTER));
+  items.push_back(BoolRow("mipmap", "Arbitrary Mipmap Detection",
+                          Config::GFX_ENHANCE_ARBITRARY_MIPMAP_DETECTION));
+  items.push_back(BoolRow("fog", "Disable Fog", Config::GFX_DISABLE_FOG));
+}
+
+void BuildPerformance(std::vector<Item>& items)
+{
+  items.push_back(ChoiceRow<ShaderCompilationMode>(
+      "shadermode", "Shader Compilation", Config::GFX_SHADER_COMPILATION_MODE,
+      {{ShaderCompilationMode::Synchronous, "Specialized"},
+       {ShaderCompilationMode::SynchronousUberShaders, "Exclusive Ubershaders"},
+       {ShaderCompilationMode::AsynchronousUberShaders, "Hybrid Ubershaders"},
+       {ShaderCompilationMode::AsynchronousSkipRendering, "Skip Drawing"}}));
+  items.push_back(BoolRow("precompile", "Compile Shaders Before Starting",
+                          Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true));
+  items.push_back(BoolRow("hires", "Load Custom Textures", Config::GFX_HIRES_TEXTURES));
+  items.push_back(
+      BoolRow("hirescache", "Prefetch Custom Textures", Config::GFX_CACHE_HIRES_TEXTURES));
+  items.push_back(BoolRow("mods", "Graphics Mods", Config::GFX_MODS_ENABLE));
+}
+
+void BuildHacks(std::vector<Item>& items)
+{
+  items.push_back(BoolRow("efbaccess", "Skip EFB Access from CPU",
+                          Config::GFX_HACK_EFB_ACCESS_ENABLE, false, true));
+  items.push_back(BoolRow("formatchanges", "Ignore Format Changes",
+                          Config::GFX_HACK_EFB_EMULATE_FORMAT_CHANGES, false, true));
+  items.push_back(
+      BoolRow("efbtotex", "EFB Copies to Texture Only", Config::GFX_HACK_SKIP_EFB_COPY_TO_RAM));
+  items.push_back(
+      BoolRow("defercopies", "Defer EFB Copies to RAM", Config::GFX_HACK_DEFER_EFB_COPIES));
+  items.push_back(ChoiceRow<int>("texcache", "Texture Cache Accuracy",
+                                 Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES,
+                                 {{0, "Safe"}, {512, "Balanced"}, {128, "Fast"}}));
+  items.push_back(
+      BoolRow("gputex", "GPU Texture Decoding", Config::GFX_ENABLE_GPU_TEXTURE_DECODING));
+  items.push_back(
+      BoolRow("xfbtotex", "XFB Copies to Texture Only", Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM));
+  items.push_back(BoolRow("immxfb", "Immediately Present XFB", Config::GFX_HACK_IMMEDIATE_XFB));
+  items.push_back(BoolRow("dupxfb", "Skip Duplicate XFBs", Config::GFX_HACK_SKIP_DUPLICATE_XFBS));
+  items.push_back(BoolRow("fastdepth", "Fast Depth Calculation", Config::GFX_FAST_DEPTH_CALC));
+  items.push_back(
+      BoolRow("bbox", "Disable Bounding Box", Config::GFX_HACK_BBOX_ENABLE, false, true));
+  items.push_back(BoolRow("vround", "Vertex Rounding", Config::GFX_HACK_VERTEX_ROUNDING));
+  items.push_back(BoolRow("viskip", "VBI Skip", Config::GFX_HACK_VI_SKIP));
+}
+
+void BuildOnScreenDisplay(std::vector<Item>& items)
+{
+  items.push_back(BoolRow("fps", "Show FPS", Config::GFX_SHOW_FPS));
+  items.push_back(BoolRow("vps", "Show VPS", Config::GFX_SHOW_VPS));
+  items.push_back(BoolRow("speed", "Show Speed", Config::GFX_SHOW_SPEED));
+  items.push_back(BoolRow("ftimes", "Show Frame Times", Config::GFX_SHOW_FTIMES));
+  items.push_back(BoolRow("graphs", "Show Performance Graphs", Config::GFX_SHOW_GRAPHS));
+  items.push_back(
+      BoolRow("showres", "Show Internal Resolution", Config::GFX_SHOW_INTERNAL_RESOLUTION));
+}
+
+void BuildEmulation(std::vector<Item>& items)
+{
+  items.push_back(ChoiceRow<float>("speedlimit", "Speed Limit", Config::MAIN_EMULATION_SPEED,
+                                   {{0.5f, "50%"},
+                                    {0.75f, "75%"},
+                                    {1.0f, "100%"},
+                                    {1.25f, "125%"},
+                                    {1.5f, "150%"},
+                                    {2.0f, "200%"},
+                                    {3.0f, "300%"},
+                                    {0.0f, "Unlimited"}}));
+  items.push_back(OverrideRow("cpuclock", "CPU Clock Override", Config::MAIN_OVERCLOCK_ENABLE,
+                              Config::MAIN_OVERCLOCK,
+                              {0.5f, 0.75f, 1.25f, 1.5f, 2.0f, 3.0f, 4.0f}));
+  items.push_back(OverrideRow("viclock", "VBI Frequency Override", Config::MAIN_VI_OVERCLOCK_ENABLE,
+                              Config::MAIN_VI_OVERCLOCK, {0.5f, 0.75f, 1.25f, 1.5f, 2.0f}));
+  items.push_back(BoolRow("syncgpu", "Sync GPU Thread", Config::MAIN_SYNC_GPU));
+  items.push_back(BoolRow("dualcore", "Dual Core", Config::MAIN_CPU_THREAD, true));
   {
-    const bool v = Config::Get(Config::GFX_VSYNC);
-    items.push_back({.id = "vsync",
-                     .label = "V-Sync",
-                     .value = OnOff(v),
-                     .choice = true,
-                     .on_adjust = [v](int) { SetSetting(Config::GFX_VSYNC, !v); }});
+    Choices<PowerPC::CPUCore> cores;
+    for (const PowerPC::CPUCore core : PowerPC::AvailableCPUCores())
+    {
+      switch (core)
+      {
+      case PowerPC::CPUCore::Interpreter:
+        cores.emplace_back(core, "Interpreter");
+        break;
+      case PowerPC::CPUCore::CachedInterpreter:
+        cores.emplace_back(core, "Cached Interpreter");
+        break;
+      default:
+        cores.emplace_back(core, "JIT Recompiler");
+        break;
+      }
+    }
+    items.push_back(ChoiceRow<PowerPC::CPUCore>("cpucore", "CPU Emulation", Config::MAIN_CPU_CORE,
+                                                std::move(cores), true));
   }
-  // FPS counter
-  {
-    const bool v = Config::Get(Config::GFX_SHOW_FPS);
-    items.push_back({.id = "fps",
-                     .label = "Show FPS",
-                     .value = OnOff(v),
-                     .choice = true,
-                     .on_adjust = [v](int) { SetSetting(Config::GFX_SHOW_FPS, !v); }});
-  }
-  // Volume
+  items.push_back(BoolRow("mmu", "MMU", Config::MAIN_MMU, true));
+  items.push_back(BoolRow("skipipl", "Skip Main Menu", Config::MAIN_SKIP_IPL, true));
+  items.push_back(BoolRow("cheats", "Cheats", Config::MAIN_ENABLE_CHEATS, true));
+}
+
+void BuildAudio(std::vector<Item>& items)
+{
   {
     const int v = Config::Get(Config::MAIN_AUDIO_VOLUME);
-    items.push_back({.id = "volume",
-                     .label = "Volume",
-                     .value = fmt::format("{}%", v),
-                     .choice = true,
-                     .on_adjust = [v](int dir) {
-                       const int next = std::clamp(v + dir * 10, 0, 100);
-                       Core::QueueHostJob(
-                           [next](Core::System& system) {
-                             Config::SetBaseOrCurrent(Config::MAIN_AUDIO_VOLUME, next);
-                             AudioCommon::UpdateSoundStream(system);
-                           },
-                           false);
-                       s_config_dirty = true;
-                     }});
+    Item item = SettingRow("volume", "Volume", {Config::MAIN_AUDIO_VOLUME.GetLocation()}, false);
+    item.value = fmt::format("{}%", v);
+    item.on_adjust = [v](int dir) {
+      ChangeGameSettings(
+          [next = std::clamp(v + dir * 10, 0, 100)](Config::LayerType layer, Core::System& system) {
+            SetValue(layer, Config::MAIN_AUDIO_VOLUME, next);
+            AudioCommon::UpdateSoundStream(system);
+          });
+    };
+    items.push_back(std::move(item));
   }
-  // Speed limit
   {
-    static constexpr std::array speeds = {1.0f, 0.0f, 0.5f, 1.5f, 2.0f};
-    static constexpr std::array names = {"100%", "Unlimited", "50%", "150%", "200%"};
-    const float cur = Config::Get(Config::MAIN_EMULATION_SPEED);
-    int idx = -1;
-    for (size_t i = 0; i < speeds.size(); ++i)
+    const bool muted = Config::Get(Config::MAIN_AUDIO_MUTED);
+    Item item = SettingRow("mute", "Mute", {Config::MAIN_AUDIO_MUTED.GetLocation()}, false);
+    item.value = OnOff(muted);
+    item.on_adjust = [muted](int) {
+      ChangeGameSettings([muted](Config::LayerType layer, Core::System& system) {
+        SetValue(layer, Config::MAIN_AUDIO_MUTED, !muted);
+        AudioCommon::UpdateSoundStream(system);
+      });
+    };
+    items.push_back(std::move(item));
+  }
+  items.push_back(ChoiceRow<bool>("dsp", "DSP Emulation", Config::MAIN_DSP_HLE,
+                                  {{true, "HLE (Fast)"}, {false, "LLE (Accurate)"}}, true));
+}
+
+void BuildControls(std::vector<Item>& items)
+{
+  const std::string cur = Config::Get(GAME_PAD_PROFILE_1);
+  std::vector<std::string> names = {""};
+  names.insert(names.end(), s_profile_names.begin(), s_profile_names.end());
+  if (std::ranges::find(names, cur) == names.end())
+    names.push_back(cur);
+  const int idx = int(std::ranges::find(names, cur) - names.begin());
+
+  Item item = SettingRow("padprofile", "Controller Profile (Port 1)",
+                         {GAME_PAD_PROFILE_1.GetLocation()}, true);
+  item.value = cur.empty() ? "Default" : cur;
+  item.on_adjust = [names = std::move(names), idx](int dir) {
+    const std::string next = names[NextChoice(idx, dir, names.size())];
+    if (next.empty())
     {
-      if (std::abs(speeds[i] - cur) < 0.01f)
-        idx = int(i);
+      // An empty value would make Dolphin load every profile in the folder; remove the key.
+      ClearGameSettings({GAME_PAD_PROFILE_1.GetLocation()});
+      return;
     }
-    items.push_back({.id = "speed",
-                     .label = "Speed Limit",
-                     .value = idx < 0 ? fmt::format("{:.0f}%", cur * 100.0f) : names[idx],
-                     .choice = true,
-                     .on_adjust = [idx](int dir) {
-                       const int next = Wrap((idx < 0 ? 0 : idx) + dir, int(speeds.size()));
-                       SetSetting(Config::MAIN_EMULATION_SPEED, speeds[next]);
-                     }});
-  }
-  // Menu theme
+    ChangeGameSettings([next](Config::LayerType layer, Core::System&) {
+      if (layer == Config::LayerType::LocalGame)
+        SetValue(layer, GAME_PAD_PROFILE_1, next);
+    });
+  };
+  items.push_back(std::move(item));
+}
+
+void BuildCategory(std::vector<Item>& items, PageId id)
+{
+  switch (id)
   {
-    const size_t idx = ThemeIndex(Config::Get(COUCH_THEME));
-    items.push_back({.id = "theme",
-                     .label = "Menu Theme",
-                     .value = THEMES[idx].name,
-                     .choice = true,
-                     .on_adjust = [idx](int dir) {
-                       const int next = Wrap(int(idx) + dir, int(THEMES.size()));
-                       SetSetting(COUCH_THEME, std::string(THEMES[next].name));
-                     }});
+  case PageId::Graphics:
+    BuildGraphics(items);
+    break;
+  case PageId::Enhancements:
+    BuildEnhancements(items);
+    break;
+  case PageId::Performance:
+    BuildPerformance(items);
+    break;
+  case PageId::Hacks:
+    BuildHacks(items);
+    break;
+  case PageId::OnScreenDisplay:
+    BuildOnScreenDisplay(items);
+    break;
+  case PageId::Emulation:
+    BuildEmulation(items);
+    break;
+  case PageId::Audio:
+    BuildAudio(items);
+    break;
+  case PageId::Controls:
+    BuildControls(items);
+    break;
+  default:
+    break;
   }
-  items.push_back({.id = "fullscreen",
-                   .label = "Toggle Fullscreen",
-                   .on_accept = [] { PushHostActionLocked(HostAction::FullScreen); }});
+}
+
+// The keys this game overrides among the settings a page manages.
+std::vector<Config::Location> OverriddenSettings(PageId id)
+{
+  std::vector<Config::Location> out;
+  std::vector<Item> items;
+  BuildCategory(items, id);
+  for (const Item& item : items)
+  {
+    for (const Config::Location& location : item.settings)
+    {
+      if (s_overridden.contains(location))
+        out.push_back(location);
+    }
+  }
+  return out;
 }
 
 const char* PageTitle(PageId id)
@@ -871,8 +1515,88 @@ const char* PageTitle(PageId id)
     return "Change Disc";
   case PageId::Settings:
     return "Settings";
+  case PageId::Graphics:
+    return "Graphics";
+  case PageId::Enhancements:
+    return "Enhancements";
+  case PageId::Performance:
+    return "Performance";
+  case PageId::Hacks:
+    return "Hacks";
+  case PageId::OnScreenDisplay:
+    return "On-Screen Display";
+  case PageId::Emulation:
+    return "Emulation";
+  case PageId::Audio:
+    return "Audio";
+  case PageId::Controls:
+    return "Controls";
   }
   return "";
+}
+
+void BuildSettings(std::vector<Item>& items, std::vector<PageState>& pages)
+{
+  items.push_back({.id = "scope", .label = "Changes apply to this game only", .enabled = false});
+  std::vector<Config::Location> overridden;
+  for (const PageId id : SETTINGS_CATEGORIES)
+  {
+    const std::vector<Config::Location> page_overridden = OverriddenSettings(id);
+    const size_t changed = page_overridden.size();
+    overridden.insert(overridden.end(), page_overridden.begin(), page_overridden.end());
+    items.push_back({.id = fmt::format("page{}", int(id)),
+                     .label = PageTitle(id),
+                     .value = changed ? fmt::format("{} changed", changed) : "",
+                     .submenu = true,
+                     .dim_value = true,
+                     .on_accept = PushPage(pages, id)});
+  }
+  items.push_back({.id = "fullscreen", .label = "Toggle Fullscreen", .on_accept = [] {
+                     PushHostActionLocked(HostAction::FullScreen);
+                   }});
+  {
+    const size_t idx = ThemeIndex(Config::Get(COUCH_THEME));
+    items.push_back({.id = "theme",
+                     .label = "Menu Theme",
+                     .value = THEMES[idx].name,
+                     .choice = true,
+                     .on_adjust = [idx](int dir) {
+                       const int next = Wrap(int(idx) + dir, int(THEMES.size()));
+                       SetGlobalSetting(COUCH_THEME, std::string(THEMES[next].name));
+                     }});
+  }
+  {
+    static constexpr std::array names = {"Off", "Quiet", "Normal", "Loud"};
+    const int level = std::clamp(Config::Get(COUCH_SOUND_LEVEL), 0, 3);
+    items.push_back({.id = "sounds",
+                     .label = "Menu Sounds",
+                     .value = names[level],
+                     .choice = true,
+                     .on_adjust = [level](int dir) {
+                       SetGlobalSetting(COUCH_SOUND_LEVEL, Wrap(level + dir, int(names.size())));
+                     }});
+  }
+  const bool promotable = std::ranges::any_of(overridden, [](const Config::Location& l) {
+    return l.system != Config::System::GameSettingsOnly;
+  });
+  items.push_back({.id = "makedefault",
+                   .label = "Make This the Default",
+                   .enabled = promotable,
+                   .confirm = "Use for all games? Press A again",
+                   .on_accept = [overridden] { MakeGameSettingsDefault(overridden); }});
+  items.push_back({.id = "resetgame",
+                   .label = "Reset This Game",
+                   .enabled = !overridden.empty(),
+                   .confirm = "Clear this game's changes? Press A again",
+                   .on_accept = [overridden] { ClearGameSettings(overridden); }});
+  items.push_back({.id = "baseline",
+                   .label = "Restore Couch Potato Defaults",
+                   .confirm = "Reset system defaults? Press A again",
+                   .on_accept = [] {
+                     // Per-game changes stay; only the system defaults are reset.
+                     Core::QueueHostJob([](Core::System&) { ApplyBaselineValues(); }, false);
+                     s_config_dirty = true;
+                   }});
 }
 
 void GoBackLocked()
@@ -880,9 +1604,9 @@ void GoBackLocked()
   s_armed_item.clear();
   if (s_pages.size() > 1)
   {
-    if (s_pages.back().id == PageId::Settings)
-      SaveConfigIfDirtyLocked();
+    SaveConfigIfDirtyLocked();
     s_pages.pop_back();
+    QueueSoundLocked(Sound::Back);
   }
   else
   {
@@ -893,7 +1617,10 @@ void GoBackLocked()
 void Activate(Item& item)
 {
   if (!item.enabled)
+  {
+    QueueSoundLocked(Sound::Deny);
     return;
+  }
   if (!item.confirm.empty())
   {
     const bool armed = s_armed_item == item.id &&
@@ -902,10 +1629,12 @@ void Activate(Item& item)
     {
       s_armed_item = item.id;
       s_armed_at = Clock::now();
+      QueueSoundLocked(Sound::Change);
       return;
     }
   }
   s_armed_item.clear();
+  QueueSoundLocked(item.on_accept ? Sound::Select : Sound::Change);
   if (item.on_accept)
     item.on_accept();
   else if (item.on_adjust)
@@ -946,7 +1675,10 @@ void BuildPage(std::vector<Item>& items, PageId id)
     BuildDiscs(items);
     break;
   case PageId::Settings:
-    BuildSettings(items);
+    BuildSettings(items, s_pages);
+    break;
+  default:
+    BuildCategory(items, id);
     break;
   }
 }
@@ -973,6 +1705,14 @@ bool IsOpen()
 void UseFont(ImFont* font)
 {
   s_font = font;
+}
+
+void ApplyBaselineIfNeeded()
+{
+  if (Config::Get(COUCH_BASELINE_VERSION) >= BASELINE_VERSION)
+    return;
+  ApplyBaselineValues();
+  Config::Save();
 }
 
 void LoadFonts()
@@ -1025,6 +1765,7 @@ void Toggle(Core::System& system)
     s_resume_on_close = state == Core::State::Running || resume_pending;
     s_waiting_for_release = false;
     s_open = true;
+    QueueSoundLocked(Sound::Open);
   }
   s_redraw_queued = false;
 
@@ -1052,6 +1793,7 @@ void PollHost(Core::System& system)
       s_waiting_for_release = false;
       s_resume_on_close = false;
       s_host_actions.clear();
+      s_pending_sound.reset();
     }
     return;
   }
@@ -1064,6 +1806,8 @@ void PollHost(Core::System& system)
   }
   if (!open && !waiting)
     return;
+
+  PlayPendingSound();
 
   const NavButtons b = ReadNavButtons();
   const auto now = Clock::now();
@@ -1095,6 +1839,8 @@ void PollHost(Core::System& system)
     s_prev_accept = b.accept;
     s_prev_back = b.back;
     s_prev_start = b.start;
+    s_prev_promote = b.promote;
+    s_prev_revert = b.revert;
     return;
   }
 
@@ -1106,9 +1852,15 @@ void PollHost(Core::System& system)
     events.push_back(Nav::Back);
   if (b.start && !s_prev_start)
     events.push_back(Nav::Close);
+  if (b.promote && !s_prev_promote)
+    events.push_back(Nav::Promote);
+  if (b.revert && !s_prev_revert)
+    events.push_back(Nav::Revert);
   s_prev_accept = b.accept;
   s_prev_back = b.back;
   s_prev_start = b.start;
+  s_prev_promote = b.promote;
+  s_prev_revert = b.revert;
 
   const std::array<bool, 4> dirs = {b.up, b.down, b.left, b.right};
   constexpr std::array<Nav, 4> dir_nav = {Nav::Up, Nav::Down, Nav::Left, Nav::Right};
@@ -1133,7 +1885,7 @@ void PollHost(Core::System& system)
     }
   }
 
-  bool refresh_slots = false, refresh_discs = false;
+  bool refresh_slots = false, refresh_discs = false, refresh_lists = false;
   {
     std::lock_guard lk(s_mutex);
     for (Nav n : events)
@@ -1145,11 +1897,14 @@ void PollHost(Core::System& system)
       refresh_slots = true;
     }
     refresh_discs = std::exchange(s_disc_refresh_requested, false);
+    refresh_lists = std::exchange(s_lists_refresh_requested, false);
   }
   if (refresh_slots)
     RefreshSlotsOnHost();
   if (refresh_discs)
     RefreshDiscCandidatesOnHost(system);
+  if (refresh_lists)
+    RefreshSettingsListsOnHost();
 
   // Keep the menu alive while the game is paused behind it.
   if (state == Core::State::Paused)
@@ -1212,6 +1967,10 @@ void Draw()
     s_nav_events.push_back(Nav::Accept);
   if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false))
     s_nav_events.push_back(Nav::Back);
+  if (ImGui::IsKeyPressed(ImGuiKey_Insert, false))
+    s_nav_events.push_back(Nav::Promote);
+  if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    s_nav_events.push_back(Nav::Revert);
 
   // ---- Apply queued navigation, rebuilding the item list whenever the page changes ----
   std::vector<Item> items;
@@ -1237,18 +1996,24 @@ void Draw()
     switch (nav)
     {
     case Nav::Up:
-      MoveSelection(page, items, -1);
-      break;
     case Nav::Down:
-      MoveSelection(page, items, +1);
+    {
+      const int before = page.selected;
+      MoveSelection(page, items, nav == Nav::Up ? -1 : +1);
+      if (page.selected != before)
+        QueueSoundLocked(Sound::Move);
       break;
+    }
     case Nav::Left:
     case Nav::Right:
       if (!items.empty())
       {
         Item& it = items[page.selected];
         if (it.choice && it.on_adjust && it.enabled)
+        {
           it.on_adjust(nav == Nav::Left ? -1 : +1);
+          QueueSoundLocked(Sound::Change);
+        }
       }
       break;
     case Nav::Accept:
@@ -1260,6 +2025,28 @@ void Draw()
       break;
     case Nav::Close:
       CloseLocked(true);
+      break;
+    case Nav::Promote:
+      if (!items.empty() && items[page.selected].promotable)
+      {
+        MakeGameSettingsDefault(items[page.selected].settings);
+        QueueSoundLocked(Sound::Select);
+      }
+      else
+      {
+        QueueSoundLocked(Sound::Deny);
+      }
+      break;
+    case Nav::Revert:
+      if (!items.empty() && items[page.selected].overridden)
+      {
+        ClearGameSettings(items[page.selected].settings);
+        QueueSoundLocked(Sound::Back);
+      }
+      else
+      {
+        QueueSoundLocked(Sound::Deny);
+      }
       break;
     }
     if (!s_open)
@@ -1423,6 +2210,15 @@ void Draw()
       const bool armed = it.id == s_armed_item;
       const std::string& label = armed ? it.confirm : it.label;
       const ImVec2 ls = font->CalcTextSizeA(font_px, FLT_MAX, 0.0f, label.c_str());
+      static constexpr const char* NEXT_LAUNCH = "Next launch";
+      const bool show_note = it.next_launch && !armed;
+      const float note_gap = 12.0f * ui;
+      const ImVec2 ns = font->CalcTextSizeA(small_px, FLT_MAX, 0.0f, NEXT_LAUNCH);
+      const float label_w = ls.x + (show_note ? note_gap + ns.x : 0.0f);
+
+      // This game's INI overrides the setting.
+      if (it.overridden)
+        dl->AddCircleFilled({rmin.x + pad_x * 0.5f, cy}, std::max(3.0f, 4.5f * ui), COLORS.accent);
 
       // Right side: chevron for submenus, < value > for choices, plain value otherwise.
       float right = rmax.x - pad_x;
@@ -1435,7 +2231,7 @@ void Draw()
       {
         const float vpx = it.choice ? font_px * 0.85f : small_px;
         std::string value = it.value;
-        const float max_vw = std::max(40.0f * ui, (right - x) - ls.x - 60.0f * ui);
+        const float max_vw = std::max(40.0f * ui, (right - x) - label_w - 60.0f * ui);
         ImVec2 vs = font->CalcTextSizeA(vpx, FLT_MAX, 0.0f, value.c_str());
         while (vs.x > max_vw && value.size() > 4)
         {
@@ -1462,6 +2258,11 @@ void Draw()
 
       dl->AddText(font, font_px, {x, cy - ls.y * 0.5f}, armed ? COLORS.warn : text_col,
                   label.c_str());
+      if (show_note)
+      {
+        dl->AddText(font, small_px, {x + ls.x + note_gap, cy - ns.y * 0.5f}, COLORS.text_dim,
+                    NEXT_LAUNCH);
+      }
 
       if (clicked && hovered && it.enabled && deferred == Deferred::None)
       {
@@ -1490,9 +2291,12 @@ void Draw()
         dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.chrome_dim, text);
         x += ts.x + 22.0f * ui;
       };
-      hint("A", IM_COL32(96, 186, 72, 255), "Select");
+      const Item* sel = n_items > 0 ? &items[page.selected] : nullptr;
+      // Overridden rows have more hints than fit; A on a choice row only cycles the value anyway.
+      if (!(sel && sel->choice && sel->overridden))
+        hint("A", IM_COL32(96, 186, 72, 255), "Select");
       hint("B", IM_COL32(222, 74, 64, 255), s_pages.size() > 1 ? "Back" : "Resume");
-      if (n_items > 0 && items[page.selected].choice)
+      if (sel && sel->choice)
       {
         const char* t = "Change";
         const ImVec2 ts = font->CalcTextSizeA(small_px, FLT_MAX, 0.0f, t);
@@ -1503,7 +2307,12 @@ void Draw()
                     stroke * 0.8f);
         x += g + 8.0f * ui;
         dl->AddText(font, small_px, {x, gy + (g - ts.y) * 0.5f}, COLORS.chrome_dim, t);
+        x += ts.x + 22.0f * ui;
       }
+      if (sel && sel->promotable)
+        hint("X", IM_COL32(64, 140, 230, 255), "Set as System Default");
+      if (sel && sel->overridden)
+        hint("Y", IM_COL32(240, 190, 40, 255), "Use System Default");
     }
   }
   ImGui::End();

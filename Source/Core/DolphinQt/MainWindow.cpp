@@ -215,11 +215,19 @@ static std::vector<std::string> StringListToStdVector(const QStringList& list)
   return result;
 }
 
+// Couch overlay: brand the main window for the Couch Potato Edition build.
+static QString CouchPotatoTitle()
+{
+  return QString::fromStdString(Common::GetScmRevStr()) + QStringLiteral(" - Couch Potato Edition");
+}
+
 MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
                        const std::string& movie_path)
     : QMainWindow(nullptr), m_system(system)
 {
-  setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
+  // Couch overlay: set up the Couch Potato default settings before anything reads them.
+  CouchOverlay::ApplyBaselineIfNeeded();
+  setWindowTitle(CouchPotatoTitle());
   setWindowIcon(Resources::GetAppIcon());
   setUnifiedTitleAndToolBarOnMac(true);
   setAcceptDrops(true);
@@ -1322,7 +1330,7 @@ void MainWindow::HideRenderWidget(bool reinit, bool is_exit)
     m_rendering_to_main = false;
     m_stack->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
     disconnect(Host::GetInstance(), &Host::RequestTitle, this, &MainWindow::setWindowTitle);
-    setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
+    setWindowTitle(CouchPotatoTitle());
   }
 
   // The following code works around a driver bug that would lead to Dolphin crashing when changing

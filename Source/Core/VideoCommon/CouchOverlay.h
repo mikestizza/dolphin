@@ -1,8 +1,8 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Couch overlay: a controller-driven in-game menu (pause, states, disc, settings, exit) drawn with
-// the on-screen ImGui layer, modelled on xemu's quick menu.
+// Couch overlay (Couch Potato Edition): a controller-driven in-game menu (pause, states, disc,
+// settings, exit) drawn with the on-screen ImGui layer, modelled on xemu's quick menu.
 //
 // Threads:
 //  - Host (hotkey poll loop): Toggle(), PollHost(), TakeHostAction().
@@ -65,4 +65,8 @@ void Draw();
 void LoadFonts();
 // Uses the given font for the menu (nullptr = the default ImGui font).
 void UseFont(ImFont* font);
+
+// UI thread, at startup: writes the Couch Potato baseline settings into the global config the
+// first time this build runs with it (or when the baseline is revised), then saves.
+void ApplyBaselineIfNeeded();
 }  // namespace CouchOverlay
