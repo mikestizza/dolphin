@@ -71,9 +71,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $sha = (git rev-parse --short HEAD)
+          # Version of the official Dolphin release this build is based on, e.g. 2609a-10.
+          $ver = (git describe --tags --match "[0-9][0-9][0-9][0-9]*" HEAD)
           $subject = (git log -1 --format=%s)
           # First run has no release to delete; ignore that failure.
           try { & gh release delete couch-latest --cleanup-tag --yes 2>&1 | Out-Null } catch {}
           $global:LASTEXITCODE = 0
-          $notes = "Latest Dolphin Couch Potato Edition build (couch-overlay branch).`n`nCommit $sha`: $subject`n`nExtract over a copy of your Dolphin folder (keep your User folder / portable.txt)."
-          gh release create couch-latest dist/Dolphin-CouchPotato-x64.zip --prerelease --target $env:GITHUB_SHA --title "Dolphin Couch Potato Edition ($sha)" --notes $notes
+          $notes = "Latest Dolphin Couch Potato Edition build (couch-overlay branch), based on Dolphin $ver.`n`nCommit $sha`: $subject`n`nExtract over a copy of your Dolphin folder (keep your User folder / portable.txt)."
+          gh release create couch-latest dist/Dolphin-CouchPotato-x64.zip --prerelease --target $env:GITHUB_SHA --title "Dolphin Couch Potato Edition $ver ($sha)" --notes $notes

@@ -16,7 +16,11 @@ Code keeps the `CouchOverlay` names and the `[CouchOverlay]` INI section so conf
 ## Repo and remotes
 
 - Fork: https://github.com/mikestizza/dolphin, work branch `couch-overlay`.
-- `git remote add upstream https://github.com/dolphin-emu/dolphin` (base is upstream `master`).
+- `git remote add upstream https://github.com/dolphin-emu/dolphin`.
+- **Base is an official Dolphin release tag, not upstream `master`.** Currently `2609a`. The fork
+  is our commits rebased on top of that tag; `git describe` gives e.g. `2609a-10`, which is also the
+  in-app version. The release tag must exist on `origin` too (push it), or CI builds get a version
+  string without it.
 - Every push to `couch-overlay` runs `.github/workflows/couch-build.yml` (Windows x64, MSVC +
   Ninja, ~25 min) and replaces the `couch-latest` prerelease ("Dolphin Couch Potato Edition") with
   `Dolphin-CouchPotato-x64.zip`.
@@ -157,7 +161,16 @@ Logs: enable in View > Show Log / Log Configuration, or read `testuser\Logs\dolp
 - Format with the repo's `Source/.clang-format` (100 columns). Match Dolphin style.
 - New code in the overlay files where possible; core edits minimal and commented.
 - Keep the CI build green. Commit messages: short imperative subject, wrapped body.
-- Periodically rebase on upstream: `git fetch upstream && git rebase upstream/master`, then rebuild.
+- Updating to a new Dolphin release (they ship roughly quarterly, e.g. 2606, 2609, 2609a):
+  1. `git fetch upstream tag <NEW>` (use `refs/tags/<NEW>`; a short tag like `2609a` can be
+     ambiguous with a commit hash prefix).
+  2. On a test branch: `git rebase --onto refs/tags/<NEW> refs/tags/<OLD>`, then
+     `git submodule update --init --recursive`, configure and build.
+  3. Run the runtime checklist below with a real game and controller.
+  4. Replace `couch-overlay` (`git push --force-with-lease origin <test-branch>:couch-overlay`) and
+     push the tag (`git push origin refs/tags/<NEW>`). CI publishes the release.
+  Hooks most likely to conflict: `HotkeyManager.{h,cpp}` (upstream adds hotkeys), `MainWindow.cpp`,
+  `HW/CPU.{h,cpp}`.
 
 ## Status and next steps
 
