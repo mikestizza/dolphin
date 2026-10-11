@@ -146,6 +146,9 @@ bool s_lists_refresh_requested = false;
 std::vector<std::string> s_shader_names;
 std::vector<std::string> s_profile_names;
 
+// Game the remembered menu position (s_pages) belongs to.
+std::string s_menu_game_id;
+
 // Paused redraw bookkeeping.
 std::atomic<bool> s_redraw_queued{false};
 Clock::time_point s_redraw_queued_at;
@@ -330,12 +333,41 @@ void PushHostActionLocked(HostAction action, int arg = 0)
   s_host_actions.push_back({action, arg});
 }
 
-void ResetMenuLocked()
+void RefreshOverrides();
+
+// Reopens the menu where it was last closed (same page and row) while the same game is running.
+void PrepareMenuLocked()
 {
-  s_pages.clear();
-  s_pages.push_back({});
+  const std::string& game_id = SConfig::GetInstance().GetGameID();
+  if (s_pages.empty() || game_id != s_menu_game_id)
+  {
+    s_pages.clear();
+    s_pages.push_back({});
+    s_menu_game_id = game_id;
+  }
   s_nav_events.clear();
   s_armed_item.clear();
+
+  // Pages fill some of their contents when entered; refresh those for the restored pages.
+  for (const PageState& page : s_pages)
+  {
+    switch (page.id)
+    {
+    case PageId::SaveState:
+    case PageId::LoadState:
+      s_slot_refresh_requested = true;
+      break;
+    case PageId::ChangeDisc:
+      s_disc_refresh_requested = true;
+      break;
+    case PageId::Settings:
+      s_lists_refresh_requested = true;
+      Core::QueueHostJob([](Core::System&) { RefreshOverrides(); }, false);
+      break;
+    default:
+      break;
+    }
+  }
 }
 
 // Writes settings changed from the menu to disk, on the UI thread.
@@ -1761,7 +1793,7 @@ void Toggle(Core::System& system)
     // Reopened before the previous close finished resuming: the game is only paused because of
     // us, so it should still resume when this menu closes.
     const bool resume_pending = s_waiting_for_release && s_resume_on_close;
-    ResetMenuLocked();
+    PrepareMenuLocked();
     s_resume_on_close = state == Core::State::Running || resume_pending;
     s_waiting_for_release = false;
     s_open = true;
